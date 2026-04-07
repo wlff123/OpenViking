@@ -936,19 +936,22 @@ const contextEnginePlugin = {
                 const memories = pickMemoriesForInjection(processed, cfg.recallLimit, queryText);
 
                 if (memories.length > 0) {
-                  const { lines: memoryLines, estimatedTokens } = await buildMemoryLinesWithBudget(
-                    memories,
-                    (uri) => client.read(uri, agentId),
-                    {
-                      recallPreferAbstract: cfg.recallPreferAbstract,
-                      recallMaxContentChars: cfg.recallMaxContentChars,
-                      recallTokenBudget: cfg.recallTokenBudget,
-                    },
+                  const memoryLines = await Promise.all(
+                    memories.map(async (item: FindResultItem) => {
+                      if (item.level === 2) {
+                        try {
+                          const content = await client.read(item.uri);
+                          if (content && typeof content === "string" && content.trim()) {
+                            return `- [${item.category ?? "memory"}] ${content.trim()}`;
+                          }
+                        } catch {
+                          // fallback to abstract
+                        }
+                      }
+                      return `- [${item.category ?? "memory"}] ${item.abstract ?? item.uri}`;
+                    }),
                   );
                   const memoryContext = memoryLines.join("\n");
-                  verboseRoutingInfo(
-                    `openviking: injecting ${memoryLines.length} memories (~${estimatedTokens} tokens, budget=${cfg.recallTokenBudget})`,
-                  );
                   verboseRoutingInfo(
                     `openviking: inject-detail ${toJsonLog({ count: memories.length, memories: summarizeInjectionMemories(memories) })}`,
                   );
