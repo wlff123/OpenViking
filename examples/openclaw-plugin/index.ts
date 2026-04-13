@@ -11,6 +11,7 @@ import {
   compileSessionPatterns,
   isTranscriptLikeIngest,
   extractLatestUserText,
+  sanitizeUserTextForCapture,
   shouldBypassSession,
 } from "./text-utils.js";
 import {
@@ -884,7 +885,7 @@ const contextEnginePlugin = {
       const eventObj = (event ?? {}) as { messages?: unknown[]; prompt?: string };
       const queryText =
         extractLatestUserText(eventObj.messages) ||
-        (typeof eventObj.prompt === "string" ? eventObj.prompt.trim() : "");
+        (typeof eventObj.prompt === "string" ? sanitizeUserTextForCapture(eventObj.prompt) : "");
       if (!queryText) {
         return;
       }
