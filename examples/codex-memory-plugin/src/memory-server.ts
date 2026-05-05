@@ -352,7 +352,7 @@ server.tool(
 )
 
 server.tool(
-  "openviking_forget",
+  "viking_forget",
   "Delete an exact OpenViking memory URI. Use openviking_recall first if you only have a query.",
   {
     uri: z.string().describe("Exact memory URI to delete"),
@@ -368,7 +368,7 @@ server.tool(
 )
 
 server.tool(
-  "openviking_health",
+  "viking_health",
   "Check whether the OpenViking server is reachable.",
   {},
   async () => {

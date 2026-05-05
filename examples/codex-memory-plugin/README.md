@@ -13,8 +13,8 @@ Codex gets four tools:
 
 - `openviking_recall`
 - `openviking_store`
-- `openviking_forget`
-- `openviking_health`
+- `viking_forget`
+- `viking_health`
 
 ## Files
 
@@ -94,7 +94,7 @@ Parameters:
 - `text`: information to store
 - `role`: optional message role, default `user`
 
-### `openviking_forget`
+### `viking_forget`
 
 Delete an exact memory URI. This example intentionally does not auto-delete by
 query; use `openviking_recall` first, then pass the exact URI.
@@ -103,7 +103,7 @@ Parameters:
 
 - `uri`: exact `viking://user/.../memories/...` or `viking://agent/.../memories/...` URI
 
-### `openviking_health`
+### `viking_health`
 
 Check server reachability.
 
