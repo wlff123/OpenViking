@@ -13,17 +13,19 @@
 
 已验证的运行位置：
 
-- 容器：`openeuler00`
+- 专用运行容器：`viking-forge-agent-runtime`
 - Linux 用户：`wlf1`
 - 仓库：`/data/wlf1/viking-forge-workspace`
 - 应用：`/data/wlf1/viking-forge-workspace/automation/viking-forge`
 - Codex 登录目录：`/home/wlf1/.codex`
 - 服务端口：`18081`
 
+原容器的默认 Docker seccomp 配置会阻止 Codex 沙箱创建用户命名空间，因此应用不直接运行在 `openeuler00`。专用容器只额外使用 `seccomp=unconfined` 允许 Codex 自己的 `bwrap` 沙箱工作；不要把 Codex 改成 `danger-full-access`，也不要给容器增加 `--privileged`。
+
 先确认本地 Codex 登录有效：
 
 ```bash
-docker exec -u wlf1 openeuler00 bash -lc 'CODEX_HOME=/home/wlf1/.codex codex login status'
+docker exec -u wlf1 viking-forge-agent-runtime bash -lc 'CODEX_HOME=/home/wlf1/.codex codex login status'
 ```
 
 应显示 `Logged in using ChatGPT`。这里不需要 `OPENAI_API_KEY`。
@@ -56,9 +58,11 @@ GitHub Actions 中不配置任何 VikingForge Secret 或 Variable。若旧版本
 ## 4. 本地配置
 
 ```bash
-docker exec -u wlf1 openeuler00 bash -lc '
+docker exec -u wlf1 viking-forge-agent-runtime bash -lc '
   mkdir -p /data/wlf1/viking-forge-runtime/runs
   chmod 700 /data/wlf1/viking-forge-runtime /data/wlf1/viking-forge-runtime/runs
+  cd /data/wlf1/viking-forge-workspace
+  uv sync --extra test --extra dev
   cd /data/wlf1/viking-forge-workspace/automation/viking-forge
   uv sync --extra test
 '
@@ -75,13 +79,19 @@ docker exec -u wlf1 openeuler00 bash -lc '
 ```dotenv
 REPOSITORY=wlff123/OpenViking
 REPOSITORY_PATH=/data/wlf1/viking-forge-workspace
+VALIDATION_VENV=/data/wlf1/viking-forge-workspace/.venv
 DATABASE_PATH=/data/wlf1/viking-forge-runtime/viking-forge.sqlite3
 RUNS_DIRECTORY=/data/wlf1/viking-forge-runtime/runs
 GIT_REMOTE=fork
 BASE_BRANCH=main
 CODEX_EXECUTABLE=/usr/local/nvm/versions/node/v25.9.0/bin/codex
 GITHUB_APP_PRIVATE_KEY_FILE=/data/wlf1/viking-forge-runtime/github-app-private-key.pem
+FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/...
 ```
+
+`FEISHU_WEBHOOK_URL` 使用飞书群自定义机器人的 Webhook，只保存在这个本地环境文件中，不放入 GitHub。暂时留空时，PR 和失败通知仍会写入 SQLite Outbox，但不会发送；补上地址并重启服务后会继续投递待处理通知。
+
+`VALIDATION_VENV` 指向基准仓库预先执行 `uv sync --extra test --extra dev` 得到的环境。修复任务只复用其中的 Ruff、pytest 和依赖，待测源码仍通过 `PYTHONPATH` 指向本次独立 worktree；这样不会为每个 Issue 重装整套依赖。
 
 ## 5. 启动
 
@@ -94,16 +104,31 @@ sudo systemctl enable --now viking-forge
 sudo systemctl status viking-forge
 ```
 
-当前 `openeuler00` 容器的 PID 1 不是 systemd，直接以 `wlf1` 启动同一命令：
+当前 PC 使用专用 sidecar。首次创建时挂载 `wlf1` 的 HOME 和 `/data`，用 `--init` 回收沙箱子进程，并只把面板端口发布到 PC 回环地址：
+
+```powershell
+docker run -d --name viking-forge-agent-runtime `
+  --init `
+  --security-opt seccomp=unconfined `
+  -p 127.0.0.1:18081:18081 `
+  -v D:/docker/home-selected/wlf1:/home/wlf1 `
+  -v D:/docker:/data `
+  openeuler00-sshfix:20260429163136 sleep infinity
+```
+
+容器已存在时直接以 `wlf1` 启动应用：
 
 ```bash
 set -a
 source /data/wlf1/viking-forge-runtime/viking-forge.env
 set +a
 export CODEX_HOME=/home/wlf1/.codex
+export PATH=/home/wlf1/.local/bin:/usr/local/nvm/versions/node/v25.9.0/bin:/usr/local/bin:/usr/bin:/bin
 cd /data/wlf1/viking-forge-workspace/automation/viking-forge
 exec uv run uvicorn viking_forge.main:app --host 0.0.0.0 --port 18081
 ```
+
+可用 `docker exec -d -u wlf1 viking-forge-agent-runtime bash -lc '<上述命令>'` 让服务在容器后台运行。当前验证实例因为创建 sidecar 时未发布端口，使用 `viking-forge-proxy` Caddy 容器把 PC 的 `127.0.0.1:18081` 转发到 sidecar 的 `18081`；新部署优先直接使用上面的 `-p`。
 
 健康检查：
 
@@ -111,7 +136,7 @@ exec uv run uvicorn viking_forge.main:app --host 0.0.0.0 --port 18081
 curl http://127.0.0.1:18081/healthz
 ```
 
-PC 访问容器时，需要把 PC 的 `127.0.0.1:18081` 反向代理到容器的 `18081`。公网 Webhook Tunnel 再指向 PC 的 18081。
+公网 Webhook Tunnel 指向 PC 的 18081，并把 GitHub Payload URL 配置成公网地址加 `/webhooks/github`。临时 Tunnel 地址会失效，长期运行应使用固定 HTTPS 域名或固定 Tunnel。
 
 ## 6. 初始化标签
 

@@ -24,6 +24,18 @@ def test_codex_schemas_are_valid_and_closed():
         assert schema["additionalProperties"] is False
 
 
+def test_triage_prompt_keeps_candidate_and_risk_flags_consistent():
+    prompt = (PROJECT / "prompts" / "triage.md").read_text()
+
+    assert "risk_flags` 非空时，`candidate` 必须为 `false`" in prompt
+
+
+def test_fix_prompt_uses_prepared_validation_environment():
+    prompt = (PROJECT / "prompts" / "fix.md").read_text()
+
+    assert "VALIDATION_VENV" in prompt
+
+
 def test_github_actions_execution_assets_are_removed():
     for name in ("agent-triage.yml", "agent-fix.yml", "agent-reconcile.yml"):
         assert not (REPOSITORY / ".github" / "workflows" / name).exists()

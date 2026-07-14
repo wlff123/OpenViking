@@ -53,6 +53,7 @@ def test_triage_uses_read_only_ephemeral_session_and_sanitized_environment(tmp_p
         "PATH": os.environ["PATH"],
         "HOME": "/home/test",
         "CODEX_HOME": "/home/test/.codex",
+        "VALIDATION_VENV": "/opt/openviking/.venv",
         "GITHUB_APP_PRIVATE_KEY": "secret",
         "VIKING_FORGE_WEBHOOK_SECRET": "secret",
         "FEISHU_WEBHOOK_URL": "secret",
@@ -70,6 +71,7 @@ def test_triage_uses_read_only_ephemeral_session_and_sanitized_environment(tmp_p
     assert "--ephemeral" in command
     assert command[command.index("--sandbox") + 1] == "read-only"
     assert record["env"]["CODEX_HOME"] == "/home/test/.codex"
+    assert record["env"]["VALIDATION_VENV"] == "/opt/openviking/.venv"
     assert "GITHUB_APP_PRIVATE_KEY" not in record["env"]
     assert "VIKING_FORGE_WEBHOOK_SECRET" not in record["env"]
     assert "FEISHU_WEBHOOK_URL" not in record["env"]

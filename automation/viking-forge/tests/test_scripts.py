@@ -102,6 +102,23 @@ def test_validation_commands_are_repository_owned():
     ]
 
 
+def test_validation_commands_can_use_prepared_environment(tmp_path, monkeypatch):
+    venv = tmp_path / ".venv"
+    monkeypatch.setenv("VALIDATION_VENV", str(venv))
+
+    assert validation_commands(["openviking/a.py", "tests/test_a.py"]) == [
+        [str(venv / "bin" / "ruff"), "check", "openviking/a.py", "tests/test_a.py"],
+        [
+            str(venv / "bin" / "ruff"),
+            "format",
+            "--check",
+            "openviking/a.py",
+            "tests/test_a.py",
+        ],
+        [str(venv / "bin" / "pytest"), "-q", "--no-cov", "tests/test_a.py"],
+    ]
+
+
 def test_validation_process_does_not_inherit_service_secrets(tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "must-not-leak")
     monkeypatch.setattr(
@@ -126,3 +143,20 @@ def test_validation_process_does_not_inherit_service_secrets(tmp_path, monkeypat
         ["uv", "run", "ruff", "format", "--check", "openviking/a.py", "tests/test_a.py"],
         ["uv", "run", "pytest", "-q", "--no-cov", "tests/test_a.py"],
     ]
+
+
+def test_validation_process_imports_from_worktree(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "viking_forge.validation.validation_commands",
+        lambda _: [
+            [
+                sys.executable,
+                "-c",
+                "import os; print(os.environ['PYTHONPATH'])",
+            ]
+        ],
+    )
+
+    results = run_validation(tmp_path, [{"path": "tests/test_a.py", "status": "A"}])
+
+    assert results[0]["output"].strip() == str(tmp_path.resolve())

@@ -176,14 +176,23 @@ def inspect_changes(worktree: str | Path, base_sha: str) -> list[dict[str, Any]]
 def validation_commands(changed_files: list[str]) -> list[list[str]]:
     if changed_files and all(path.startswith("docs/") for path in changed_files):
         return [["npm", "--prefix", "docs", "run", "docs:build"]]
+    validation_venv = os.environ.get("VALIDATION_VENV")
+    ruff = (
+        [str(Path(validation_venv) / "bin" / "ruff")] if validation_venv else ["uv", "run", "ruff"]
+    )
+    pytest = (
+        [str(Path(validation_venv) / "bin" / "pytest")]
+        if validation_venv
+        else ["uv", "run", "pytest"]
+    )
     python_files = [path for path in changed_files if path.endswith(".py")]
     test_files = [
         path for path in python_files if path.startswith("tests/test_") or "/test_" in f"/{path}"
     ]
     return [
-        ["uv", "run", "ruff", "check", *python_files],
-        ["uv", "run", "ruff", "format", "--check", *python_files],
-        ["uv", "run", "pytest", "-q", "--no-cov", *test_files],
+        [*ruff, "check", *python_files],
+        [*ruff, "format", "--check", *python_files],
+        [*pytest, "-q", "--no-cov", *test_files],
     ]
 
 
@@ -196,6 +205,7 @@ def run_validation(worktree: str | Path, changed: list[dict[str, Any]]) -> list[
         environment = {
             key: value for key, value in os.environ.items() if key in _ALLOWED_ENVIRONMENT
         }
+        environment["PYTHONPATH"] = str(root)
         completed = subprocess.run(
             command,
             cwd=root,
