@@ -68,6 +68,7 @@ class Store:
                 workflow_url TEXT,
                 pr_number INTEGER,
                 pr_url TEXT,
+                last_error TEXT,
                 updated_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS events (
@@ -107,6 +108,12 @@ class Store:
             );
             """
         )
+        issue_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(issues)").fetchall()
+        }
+        if "last_error" not in issue_columns:
+            self._connection.execute("ALTER TABLE issues ADD COLUMN last_error TEXT")
         now = int(time.time())
         self._connection.execute(
             """
@@ -379,9 +386,7 @@ class Store:
                 raise
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute(
-            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-        ).fetchone()
+        row = self.connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
             return None
         run = dict(row)
@@ -420,6 +425,14 @@ class Store:
             self.connection.execute(
                 f"UPDATE issues SET {', '.join(fields)} WHERE issue_number = ?",
                 values,
+            )
+
+    def update_issue_error(self, issue_number: int, error: str | None) -> None:
+        value = error[-2000:] if error else None
+        with self._lock, self.connection:
+            self.connection.execute(
+                "UPDATE issues SET last_error = ?, updated_at = ? WHERE issue_number = ?",
+                (value, int(time.time()), issue_number),
             )
 
     def enqueue_notification(

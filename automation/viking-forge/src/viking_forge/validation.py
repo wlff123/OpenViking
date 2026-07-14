@@ -29,6 +29,21 @@ DENIED_FILES = {
 MAX_FILES = 5
 MAX_CHANGED_LINES = 500
 MAX_VALIDATION_OUTPUT = 8192
+_ALLOWED_ENVIRONMENT = {
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "NODE_EXTRA_CA_CERTS",
+    "PATH",
+    "PIP_CACHE_DIR",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TERM",
+    "TMPDIR",
+    "UV_CACHE_DIR",
+    "UV_PYTHON_INSTALL_DIR",
+    "XDG_CACHE_HOME",
+}
 
 
 class PatchPolicyError(RuntimeError):
@@ -178,7 +193,17 @@ def run_validation(worktree: str | Path, changed: list[dict[str, Any]]) -> list[
     results: list[dict[str, Any]] = []
     for command in validation_commands(files):
         started = time.monotonic()
-        completed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)
+        environment = {
+            key: value for key, value in os.environ.items() if key in _ALLOWED_ENVIRONMENT
+        }
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         result = {
             "command": command,
             "exit_code": completed.returncode,

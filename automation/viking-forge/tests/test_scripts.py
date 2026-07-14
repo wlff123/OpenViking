@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import subprocess
+import sys
 
 import pytest
 
@@ -11,6 +12,7 @@ from scripts.reconcile import build_snapshot
 from viking_forge.validation import (
     PatchPolicyError,
     inspect_changes,
+    run_validation,
     validate_changed_files,
     validation_commands,
 )
@@ -125,6 +127,27 @@ def test_validation_commands_are_repository_owned():
     assert validation_commands(["docs/guide.md"]) == [
         ["npm", "--prefix", "docs", "run", "docs:build"]
     ]
+
+
+def test_validation_process_does_not_inherit_service_secrets(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "must-not-leak")
+    monkeypatch.setattr(
+        "viking_forge.validation.validation_commands",
+        lambda _: [
+            [
+                sys.executable,
+                "-c",
+                "import os; print(os.getenv('GITHUB_APP_PRIVATE_KEY', 'missing'))",
+            ]
+        ],
+    )
+
+    results = run_validation(
+        tmp_path,
+        [{"path": "tests/test_a.py", "status": "A"}],
+    )
+
+    assert results[0]["output"].strip() == "missing"
     assert validation_commands(["openviking/a.py", "tests/test_a.py"]) == [
         ["uv", "run", "ruff", "check", "openviking/a.py", "tests/test_a.py"],
         ["uv", "run", "ruff", "format", "--check", "openviking/a.py", "tests/test_a.py"],
