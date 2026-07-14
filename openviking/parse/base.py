@@ -54,18 +54,29 @@ def format_table_to_markdown(rows: List[List[str]], has_header: bool = True) -> 
     if not rows:
         return ""
 
+    def format_cell(cell: str) -> str:
+        return (
+            str(cell)
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\n", "<br>")
+            .replace("|", r"\|")
+        )
+
+    formatted_rows = [[format_cell(cell) for cell in row] for row in rows]
+
     # Calculate maximum width for each column
-    col_count = max(len(row) for row in rows)
+    col_count = max(len(row) for row in formatted_rows)
     col_widths = [0] * col_count
-    for row in rows:
+    for row in formatted_rows:
         for i, cell in enumerate(row):
-            col_widths[i] = max(col_widths[i], len(str(cell)))
+            col_widths[i] = max(col_widths[i], len(cell))
 
     lines = []
-    for row_idx, row in enumerate(rows):
+    for row_idx, row in enumerate(formatted_rows):
         # Pad missing columns
         padded_row = list(row) + [""] * (col_count - len(row))
-        cells = [str(cell).ljust(col_widths[i]) for i, cell in enumerate(padded_row)]
+        cells = [cell.ljust(col_widths[i]) for i, cell in enumerate(padded_row)]
         lines.append("| " + " | ".join(cells) + " |")
 
         # Add separator row after header
