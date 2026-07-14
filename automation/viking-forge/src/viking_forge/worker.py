@@ -209,17 +209,16 @@ class LocalWorker:
         self.github.add_label(issue_number, "agent:pr-open")
         for label in ("agent:ready", "agent:claimed", "agent:blocked"):
             self.github.remove_label(issue_number, label)
-        self.store.update_issue_metadata(issue_number, pr_number=pr_number, pr_url=pr_url)
-        self.store.update_issue_error(issue_number, None)
-        self.store.transition_issue(issue_number, "pr_open", event_type="pr_opened", run_id=run_id)
         persisted_result = {
             "codex": result,
             "changed": changed,
             "validation": validation_results,
         }
-        self.store.enqueue_notification(
+        self.store.record_pr_open(
+            issue_number,
             run_id,
-            "pr_open",
+            pr_number,
+            pr_url,
             {
                 "issue_number": issue_number,
                 "issue_title": issue["title"],
@@ -229,14 +228,20 @@ class LocalWorker:
                 "validation": validation_results,
                 "pr_url": pr_url,
             },
+            run_result=persisted_result,
         )
-        self.store.finish_run(run_id, "succeeded", result=persisted_result)
 
     def _fail_run(self, run: dict[str, Any], error: Exception) -> None:
         run_id = str(run["run_id"])
         issue_number = int(run["issue_number"])
         message = str(error) or error.__class__.__name__
         issue = self.store.get_issue(issue_number)
+        current_run = self.store.get_run(run_id)
+        if current_run and current_run["status"] in {"succeeded", "failed"}:
+            return
+        if issue and issue["bot_state"] == "closed":
+            self.store.finish_run(run_id, "failed", error=message)
+            return
         if issue and issue["bot_state"] != "blocked":
             try:
                 self.store.transition_issue(

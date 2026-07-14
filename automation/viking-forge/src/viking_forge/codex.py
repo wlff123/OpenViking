@@ -19,12 +19,47 @@ _ALLOWED_ENVIRONMENT = {
     "LC_ALL",
     "NODE_EXTRA_CA_CERTS",
     "PATH",
+    "REPOSITORY_PATH",
     "SSL_CERT_DIR",
     "SSL_CERT_FILE",
     "TERM",
     "VALIDATION_VENV",
 }
 _MAX_LOG_SIZE = 200_000
+
+
+def _toml_string(value: str | Path) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _permission_config(kind: str, worktree: Path, environment: Mapping[str, str]) -> list[str]:
+    access = "read" if kind == "triage" else "write"
+    extends = ":read-only" if kind == "triage" else ":workspace"
+    filesystem = [
+        '":root"="deny"',
+        '":minimal"="read"',
+        f'":workspace_roots"={{"."={_toml_string(access)}}}',
+    ]
+
+    codex_home = environment.get("CODEX_HOME")
+    if codex_home:
+        filesystem.append(f'{_toml_string(Path(codex_home) / "tmp")}="write"')
+    validation_venv = environment.get("VALIDATION_VENV")
+    if validation_venv:
+        filesystem.append(f'{_toml_string(validation_venv)}="read"')
+    repository = environment.get("REPOSITORY_PATH")
+    if repository:
+        filesystem.append(f'{_toml_string(Path(repository) / ".git")}="read"')
+
+    return [
+        'default_permissions="vikingforge"',
+        f'permissions.vikingforge.extends="{extends}"',
+        f"permissions.vikingforge.workspace_roots={{{_toml_string(worktree)}=true}}",
+        f"permissions.vikingforge.filesystem={{{','.join(filesystem)}}}",
+        "permissions.vikingforge.network.enabled=false",
+        'web_search="disabled"',
+        'approval_policy="never"',
+    ]
 
 
 class CodexRunner:
@@ -69,24 +104,33 @@ class CodexRunner:
         result_path = artifacts / "result.json"
         prompt_path = self.prompts_directory / f"{kind}.md"
         schema_path = self.schemas_directory / f"{kind}.json"
-        sandbox = "read-only" if kind == "triage" else "workspace-write"
-        command = [
-            self.executable,
-            "exec",
-            "--ephemeral",
-            "--sandbox",
-            sandbox,
-            "--output-schema",
-            str(schema_path),
-            "-o",
-            str(result_path),
-            "-",
-        ]
         environment = {
             key: value
             for key, value in self.source_environment.items()
             if key in _ALLOWED_ENVIRONMENT
         }
+        command = [
+            self.executable,
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--disable",
+            "apps",
+            "--disable",
+            "hooks",
+            "--disable",
+            "multi_agent",
+            "--disable",
+            "remote_plugin",
+            "--output-schema",
+            str(schema_path),
+            "-o",
+            str(result_path),
+        ]
+        for config in _permission_config(kind, worktree_path, environment):
+            command.extend(("-c", config))
+        command.append("-")
 
         try:
             context_files[0].write_text(

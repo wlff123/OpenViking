@@ -177,7 +177,7 @@ sqlite3 /data/wlf1/viking-forge-runtime/viking-forge.sqlite3 \
 sudo systemctl stop viking-forge
 ```
 
-容器内手工启动时，向 Uvicorn 进程发送 `SIGTERM`。停止服务不会删除队列；重启时遗留的 `running` 任务会恢复为 `queued`。若要阻止新任务，同时停掉服务并在 GitHub 暂停 Webhook，不要直接修改 SQLite。
+容器内手工启动时，向 Uvicorn 进程发送 `SIGTERM`。停止服务不会删除队列；尚未领取的 `queued` 任务会保留，重启时遗留的 `running` 任务会标记为 `failed`，对应 Issue 进入 `blocked`，需要维护者确认后重新添加 `agent:retriage` 或 `agent:ready`。若要阻止新任务，同时停掉服务并在 GitHub 暂停 Webhook，不要直接修改 SQLite。
 
 ## 9. 验收清单
 

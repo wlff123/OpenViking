@@ -34,7 +34,7 @@
 
 - [ ] **Step 1: Write failing queue tests**
 
-Add tests proving that enqueue changes the Issue state atomically, duplicate active work is rejected, claim is FIFO, completion clears `active_run_id`, and initialization returns interrupted `running` work to `queued`.
+增加测试，证明入队与 Issue 状态更新是原子的、重复活动任务会被拒绝、领取顺序为 FIFO、完成后会清除 `active_run_id`，以及初始化会把中断的 `running` 任务标记为失败并阻断对应 Issue。
 
 - [ ] **Step 2: Verify RED**
 
@@ -44,7 +44,7 @@ Expected: failures because the `runs` table and queue methods do not exist.
 
 - [ ] **Step 3: Implement the minimal queue**
 
-Create a `runs` table with `run_id`, `issue_number`, `kind`, `issue_revision`, `status`, `result_json`, `error`, and timestamps. Use `BEGIN IMMEDIATE` for enqueue and claim, one active run per Issue, UUID run IDs, and startup recovery from `running` to `queued`.
+创建包含 `run_id`、`issue_number`、`kind`、`issue_revision`、`status`、`result_json`、`error` 和时间戳的 `runs` 表。入队和领取使用 `BEGIN IMMEDIATE`，每个 Issue 只允许一个活动任务，运行 ID 使用 UUID；启动时将中断的 `running` 任务标记为失败，避免从外部发布步骤中间续跑。
 
 - [ ] **Step 4: Verify GREEN and commit**
 
@@ -81,7 +81,7 @@ Inject a fake executable that records arguments and environment, writes valid JS
 
 ```python
 assert "--ephemeral" in command
-assert command[command.index("--sandbox") + 1] == "read-only"
+assert 'permissions.vikingforge.extends=":read-only"' in command
 assert "GITHUB_APP_PRIVATE_KEY" not in child_environment
 ```
 
@@ -291,4 +291,3 @@ Start the service under `wlf1`, create a bounded documentation Issue, choose “
 Commit: `docs:document-local-vikingforge-deployment`
 
 Create a non-draft PR against `wlff123/OpenViking:main`, wait for relevant checks, merge into the Fork, and leave the local service running on the documented URL.
-

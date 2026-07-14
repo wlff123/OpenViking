@@ -3,7 +3,7 @@
 ## 已完成
 
 - 将 Codex 分诊和修复从 GitHub Actions 迁移到维护者本地机器。
-- 新增 SQLite 持久化运行队列，支持进程重启恢复和单 Issue 活动任务约束。
+- 新增 SQLite 持久化运行队列，保留未领取任务；重启时安全阻断执行中任务，并约束单 Issue 只能有一个活动任务。
 - 每次运行创建独立 detached Git worktree，并启动独立 `codex exec --ephemeral`。
 - Codex 和验证进程使用环境白名单，不继承服务密钥。
 - 新增本地补丁门禁、仓库验证和 GitHub Data API 发布器。

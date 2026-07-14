@@ -19,8 +19,32 @@ def apply_github_event(
 ) -> str:
     if payload.get("repository", {}).get("full_name") != repository:
         return "rejected"
-    if not store.record_delivery(f"github:{delivery_id}", event_type):
+    stored_delivery_id = f"github:{delivery_id}"
+    if not store.begin_delivery(stored_delivery_id, event_type):
         return "ignored"
+    try:
+        result = _dispatch_github_event(
+            store,
+            event_type,
+            payload,
+            trusted_app_login=trusted_app_login,
+            actor_can_write=actor_can_write,
+        )
+    except Exception:
+        store.retry_delivery(stored_delivery_id)
+        raise
+    store.complete_delivery(stored_delivery_id)
+    return result
+
+
+def _dispatch_github_event(
+    store: Store,
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    trusted_app_login: str,
+    actor_can_write: bool,
+) -> str:
     if event_type == "pull_request":
         return _apply_pull_request_event(store, payload)
     if event_type != "issues":
@@ -29,9 +53,11 @@ def apply_github_event(
     action = payload.get("action")
     issue_number = int(issue["number"])
     if action in {"opened", "reopened", "edited"}:
+        existing = store.get_issue(issue_number)
+        revision = compute_issue_revision(str(issue.get("title", "")), issue.get("body"))
         store.upsert_issue(
             issue_number,
-            compute_issue_revision(str(issue.get("title", "")), issue.get("body")),
+            revision,
             str(issue.get("title", "")),
             str(issue.get("html_url", "")),
             str(issue.get("user", {}).get("login", "unknown")),
@@ -39,6 +65,8 @@ def apply_github_event(
         )
         if action == "reopened" and store.get_issue(issue_number)["bot_state"] == "closed":
             store.transition_issue(issue_number, "awaiting_decision", event_type="issue_reopened")
+        if action == "edited" and existing is not None and existing["revision"] != revision:
+            store.invalidate_issue_analysis(issue_number, event_type="issue_edited")
         return "applied"
     if action == "labeled":
         label = str(payload.get("label", {}).get("name", ""))
@@ -125,20 +153,16 @@ def _apply_pull_request_event(store: Store, payload: dict[str, Any]) -> str:
         return "ignored"
     pr_number = int(pull_request["number"])
     issue = store.get_issue_by_pr_number(pr_number)
-    if issue is None or issue["bot_state"] != "pr_open":
+    if issue is None or (
+        issue["bot_state"] != "pr_open"
+        and not (pull_request.get("merged") and issue["bot_state"] == "closed")
+    ):
         return "ignored"
     merged = bool(pull_request.get("merged"))
-    target = "merged" if merged else "closed"
-    store.transition_issue(
-        int(issue["issue_number"]),
-        target,
-        event_type="generated_pr_merged" if merged else "generated_pr_closed",
-        payload={"pr_number": pr_number},
-    )
     if merged:
-        store.enqueue_notification(
-            f"pr:{pr_number}:merged",
-            "merged",
+        store.record_pr_merged(
+            int(issue["issue_number"]),
+            pr_number,
             {
                 "issue_number": issue["issue_number"],
                 "issue_title": issue["title"],
@@ -148,5 +172,12 @@ def _apply_pull_request_event(store: Store, payload: dict[str, Any]) -> str:
                 "validation": "-",
                 "pr_url": pull_request.get("html_url") or issue["pr_url"],
             },
+        )
+    else:
+        store.transition_issue(
+            int(issue["issue_number"]),
+            "closed",
+            event_type="generated_pr_closed",
+            payload={"pr_number": pr_number},
         )
     return "applied"

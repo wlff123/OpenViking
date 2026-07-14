@@ -69,6 +69,17 @@ def test_duplicate_delivery_is_ignored(tmp_path):
     assert apply_github_event(store, "issues", "same", payload) == "ignored"
 
 
+def test_failed_delivery_can_be_retried(tmp_path):
+    store = make_store(tmp_path)
+    invalid = issue_payload("opened")
+    del invalid["issue"]["number"]
+
+    with pytest.raises(KeyError):
+        apply_github_event(store, "issues", "retryable", invalid)
+
+    assert apply_github_event(store, "issues", "retryable", issue_payload("opened")) == "applied"
+
+
 def test_decision_labels_drive_state(tmp_path):
     store = make_store(tmp_path)
     apply_github_event(store, "issues", "open", issue_payload("opened"))
@@ -222,6 +233,25 @@ def test_ready_rejects_non_maintainer(tmp_path):
     assert store.get_issue(8)["bot_state"] == "waiting_approval"
 
 
+def test_edit_invalidates_completed_triage_and_requires_new_analysis(tmp_path):
+    store = make_store(tmp_path)
+    complete_candidate_triage(store)
+    edited = issue_payload("edited")
+    edited["issue"]["body"] = "Updated steps"
+
+    assert apply_github_event(store, "issues", "edited", edited) == "applied"
+
+    issue = store.get_issue(8)
+    assert issue["bot_state"] == "awaiting_decision"
+    assert issue["triage_json"] is None
+    ready = issue_payload("labeled", "agent:ready", sender="maintainer", labels=["agent:ready"])
+    ready["issue"]["body"] = "Updated steps"
+    assert (
+        apply_github_event(store, "issues", "ready-after-edit", ready, actor_can_write=True)
+        == "ignored"
+    )
+
+
 def test_unrelated_repository_is_rejected(tmp_path):
     store = make_store(tmp_path)
     payload = issue_payload("opened")
@@ -229,6 +259,25 @@ def test_unrelated_repository_is_rejected(tmp_path):
 
     assert apply_github_event(store, "issues", "delivery", payload) == "rejected"
     assert store.get_issue(8) is None
+
+
+def test_closing_issue_cancels_active_run(tmp_path):
+    store = make_store(tmp_path)
+    apply_github_event(store, "issues", "open", issue_payload("opened"))
+    apply_github_event(store, "issues", "analyze", issue_payload("labeled", "agent:analyze"))
+    run_id = store.get_issue(8)["active_run_id"]
+    store.claim_run()
+
+    closed = issue_payload("closed")
+    closed["issue"]["state"] = "closed"
+    assert apply_github_event(store, "issues", "closed", closed) == "applied"
+
+    issue = store.get_issue(8)
+    run = store.get_run(run_id)
+    assert issue["bot_state"] == "closed"
+    assert issue["active_run_id"] is None
+    assert run["status"] == "failed"
+    assert "closed" in run["error"].lower()
 
 
 @pytest.mark.parametrize(
@@ -266,3 +315,34 @@ def test_generated_pull_request_closed_updates_issue(tmp_path, merged, expected_
     assert store.get_issue(8)["bot_state"] == expected_state
     notification = store.get_notification("pr:19:merged", "merged")
     assert (notification is not None) is merged
+
+
+def test_merged_pull_request_wins_when_issue_closed_event_arrives_first(tmp_path):
+    store = make_store(tmp_path)
+    store.upsert_issue(8, "rev", "Title", "https://example.test/8", "user", "open")
+    for state in (
+        "triaging",
+        "waiting_approval",
+        "claimed",
+        "coding",
+        "validating",
+        "publishing",
+        "pr_open",
+        "closed",
+    ):
+        store.transition_issue(8, state, event_type=f"entered_{state}")
+    store.update_issue_metadata(8, pr_number=19, pr_url="https://example.test/pull/19")
+    payload = {
+        "action": "closed",
+        "repository": {"full_name": "volcengine/OpenViking"},
+        "pull_request": {
+            "number": 19,
+            "merged": True,
+            "html_url": "https://example.test/pull/19",
+            "labels": [{"name": "agent:generated"}],
+        },
+    }
+
+    assert apply_github_event(store, "pull_request", "merged-after-close", payload) == "applied"
+    assert store.get_issue(8)["bot_state"] == "merged"
+    assert store.get_notification("pr:19:merged", "merged") is not None

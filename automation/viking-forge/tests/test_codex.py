@@ -44,7 +44,7 @@ def make_runner(executable, source_environment):
     )
 
 
-def test_triage_uses_read_only_ephemeral_session_and_sanitized_environment(tmp_path):
+def test_triage_uses_read_only_permission_and_sanitized_environment(tmp_path):
     executable = make_fake_codex(
         tmp_path,
         '{"summary":"clear","candidate":true}',
@@ -69,7 +69,7 @@ def test_triage_uses_read_only_ephemeral_session_and_sanitized_environment(tmp_p
     command = record["args"]
     assert command[0] == "exec"
     assert "--ephemeral" in command
-    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert 'permissions.vikingforge.extends=":read-only"' in command
     assert record["env"]["CODEX_HOME"] == "/home/test/.codex"
     assert record["env"]["VALIDATION_VENV"] == "/opt/openviking/.venv"
     assert "GITHUB_APP_PRIVATE_KEY" not in record["env"]
@@ -81,7 +81,7 @@ def test_triage_uses_read_only_ephemeral_session_and_sanitized_environment(tmp_p
     assert (run_dir / "stderr.log").read_text() == "fake stderr\n"
 
 
-def test_fix_uses_workspace_write_and_temporary_triage_context(tmp_path):
+def test_fix_uses_workspace_permission_and_temporary_triage_context(tmp_path):
     executable = make_fake_codex(tmp_path)
     runner = make_runner(executable, {"PATH": os.environ["PATH"]})
     worktree = tmp_path / "worktree"
@@ -96,9 +96,59 @@ def test_fix_uses_workspace_write_and_temporary_triage_context(tmp_path):
     )
 
     command = json.loads((tmp_path / "record.json").read_text())["args"]
-    assert command[command.index("--sandbox") + 1] == "workspace-write"
+    assert 'permissions.vikingforge.extends=":workspace"' in command
     assert not (worktree / "issue-context.json").exists()
     assert not (worktree / "triage.json").exists()
+
+
+def test_codex_uses_least_privilege_permission_profile(tmp_path):
+    executable = make_fake_codex(tmp_path)
+    repository = tmp_path / "repository"
+    validation_venv = repository / ".venv"
+    codex_home = tmp_path / "codex-home"
+    runner = make_runner(
+        executable,
+        {
+            "PATH": os.environ["PATH"],
+            "HOME": str(tmp_path),
+            "CODEX_HOME": str(codex_home),
+            "REPOSITORY_PATH": str(repository),
+            "VALIDATION_VENV": str(validation_venv),
+        },
+    )
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    runner.run(
+        "fix",
+        worktree,
+        tmp_path / "artifacts",
+        {"number": 42},
+        triage={"candidate": True},
+    )
+
+    command = json.loads((tmp_path / "record.json").read_text())["args"]
+    configs = [command[index + 1] for index, value in enumerate(command) if value == "-c"]
+    assert "--sandbox" not in command
+    assert "--ignore-user-config" in command
+    assert "--ignore-rules" in command
+    assert 'default_permissions="vikingforge"' in configs
+    assert 'permissions.vikingforge.extends=":workspace"' in configs
+    filesystem = next(
+        value for value in configs if value.startswith("permissions.vikingforge.filesystem=")
+    )
+    assert '":root"="deny"' in filesystem
+    assert '":workspace_roots"={"."="write"}' in filesystem
+    assert str(codex_home / "tmp") in filesystem
+    assert str(validation_venv) in filesystem
+    assert str(repository / ".git") in filesystem
+    assert str(worktree) in next(
+        value for value in configs if value.startswith("permissions.vikingforge.workspace_roots=")
+    )
+    assert "permissions.vikingforge.network.enabled=false" in configs
+    assert 'web_search="disabled"' in configs
+    for feature in ("apps", "hooks", "multi_agent", "remote_plugin"):
+        assert command[command.index("--disable", command.index(feature) - 1) + 1] == feature
 
 
 @pytest.mark.parametrize(

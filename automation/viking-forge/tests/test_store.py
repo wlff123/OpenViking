@@ -123,7 +123,7 @@ def test_finish_run_clears_active_run(store):
     assert run["result"] == {"candidate": True}
 
 
-def test_initialize_requeues_interrupted_run(tmp_path):
+def test_initialize_blocks_interrupted_run_for_manual_retry(tmp_path):
     database_path = tmp_path / "forge.sqlite3"
     first_store = Store(database_path)
     first_store.initialize()
@@ -135,8 +135,13 @@ def test_initialize_requeues_interrupted_run(tmp_path):
     recovered_store = Store(database_path)
     recovered_store.initialize()
     try:
-        assert recovered_store.get_run(run_id)["status"] == "queued"
-        assert recovered_store.claim_run(now=200)["run_id"] == run_id
+        run = recovered_store.get_run(run_id)
+        issue = recovered_store.get_issue(16)
+        assert run["status"] == "failed"
+        assert "restart" in run["error"].lower()
+        assert issue["bot_state"] == "blocked"
+        assert issue["active_run_id"] is None
+        assert recovered_store.claim_run(now=200) is None
     finally:
         recovered_store.close()
 
@@ -150,3 +155,32 @@ def test_enqueue_rolls_back_when_transition_is_invalid(store):
     assert store.get_issue(17)["active_run_id"] is None
     count = store.connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
     assert count == 0
+
+
+def test_record_pr_open_persists_state_metadata_and_notification(store):
+    store.upsert_issue(18, "rev", "Title", "https://example.test/18", "user", "open")
+    for state in ("triaging", "waiting_approval"):
+        store.transition_issue(18, state, event_type=f"entered_{state}")
+    run_id = store.enqueue_run(18, "fix", "claimed")
+    store.claim_run()
+    for state in ("coding", "validating", "publishing"):
+        store.transition_issue(18, state, event_type=f"entered_{state}", run_id=run_id)
+    payload = {"issue_number": 18, "pr_url": "https://example.test/pull/20"}
+
+    store.record_pr_open(
+        18,
+        run_id,
+        20,
+        "https://example.test/pull/20",
+        payload,
+        run_result={"codex": {"summary": "fixed"}},
+    )
+
+    issue = store.get_issue(18)
+    assert issue["bot_state"] == "pr_open"
+    assert issue["pr_number"] == 20
+    assert issue["active_run_id"] is None
+    assert store.get_run(run_id)["status"] == "succeeded"
+    notification = store.get_notification(run_id, "pr_open")
+    assert notification is not None
+    assert notification["payload_json"]
