@@ -1,0 +1,34 @@
+name: Agent Reconcile
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Read bounded GitHub state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh api --paginate --slurp "repos/$REPOSITORY/issues?state=all&per_page=100" | jq 'add | map(select(has("pull_request") | not)) | .[:1000]' > issues.json
+          gh api --paginate --slurp "repos/$REPOSITORY/pulls?state=all&per_page=100" | jq 'add | map(select(any(.labels[]?; .name == "agent:generated")) | .issue_number = (try ((.body // .title) | capture("#(?<n>[0-9]+)").n | tonumber) catch null))' > pull-requests.json
+      - name: Build and send signed snapshot
+        env:
+          CALLBACK_URL: ${{ secrets.VIKING_FORGE_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.VIKING_FORGE_CALLBACK_SECRET }}
+        run: |
+          python automation/viking-forge/scripts/reconcile.py --issues issues.json --pull-requests pull-requests.json --output snapshot.json --snapshot-id "${{ github.run_id }}:${{ github.run_attempt }}"
+          python automation/viking-forge/scripts/post_callback.py --url "$CALLBACK_URL/callbacks/reconcile" --secret "$CALLBACK_SECRET" --payload "$(cat snapshot.json)"
+

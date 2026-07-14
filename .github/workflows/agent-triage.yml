@@ -1,0 +1,137 @@
+name: Agent Triage
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+    permissions:
+      issues: read
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ github.event.label.name }}
+          ACTOR: ${{ github.actor }}
+          APP_BOT: ${{ vars.VIKING_FORGE_APP_SLUG }}[bot]
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          authorized=false
+          if [[ "$LABEL" == "agent:analyze" && "$ACTOR" == "$APP_BOT" ]]; then
+            authorized=true
+          elif [[ "$LABEL" == "agent:retriage" ]]; then
+            permission=$(gh api "repos/$REPOSITORY/collaborators/$ACTOR/permission" --jq .permission)
+            [[ "$permission" =~ ^(admin|maintain|write)$ ]] && authorized=true
+          fi
+          echo "authorized=$authorized" >> "$GITHUB_OUTPUT"
+
+  triage:
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - name: Build untrusted Issue context
+        run: python automation/viking-forge/scripts/issue_context.py --output issue-context.json
+      - name: Run read-only Codex triage
+        uses: openai/codex-action@b11346a6fa031e2e164ab4b7c7ea201afffd7d59 # v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: automation/viking-forge/prompts/triage.md
+          output-schema-file: automation/viking-forge/schemas/triage.json
+          output-file: triage.json
+          working-directory: ${{ github.workspace }}
+          permission-profile: ':read-only'
+          allow-bot-users: true
+          model: ${{ vars.VIKING_FORGE_CODEX_MODEL }}
+          effort: ${{ vars.VIKING_FORGE_CODEX_EFFORT }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: triage-${{ github.run_id }}
+          path: |
+            issue-context.json
+            triage.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [authorize, triage]
+    if: needs.authorize.outputs.authorized == 'true' && needs.triage.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: triage-${{ github.run_id }}
+      - id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.VIKING_FORGE_APP_ID }}
+          private-key: ${{ secrets.VIKING_FORGE_PRIVATE_KEY }}
+      - name: Publish triage result
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh api "repos/$REPOSITORY/issues/$ISSUE_NUMBER" > live-issue.json
+          live_revision=$(python -c 'import hashlib,json; x=json.load(open("live-issue.json")); value=str(x.get("title") or "")+"\0"+str(x.get("body") or ""); print(hashlib.sha256(value.encode()).hexdigest())')
+          expected_revision=$(jq -r .issue_revision issue-context.json)
+          [[ "$live_revision" == "$expected_revision" ]] || { echo "Issue changed during triage"; exit 1; }
+          summary=$(jq -r .summary triage.json)
+          candidate=$(jq -r .candidate triage.json)
+          needs_info=$(jq -r .needs_info triage.json)
+          body=$(printf '<!-- viking-forge-triage -->\n## VikingForge 分诊\n\n%s\n\n- 可自动修复候选：`%s`\n- 需要补充信息：`%s`\n- 置信度：`%s`' "$summary" "$candidate" "$needs_info" "$(jq -r .confidence triage.json)")
+          comment_id=$(gh api "repos/$REPOSITORY/issues/$ISSUE_NUMBER/comments" --paginate --jq '.[] | select(.body | contains("<!-- viking-forge-triage -->")) | .id' | head -n 1)
+          if [[ -n "$comment_id" ]]; then
+            gh api --method PATCH "repos/$REPOSITORY/issues/comments/$comment_id" -f body="$body"
+          else
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPOSITORY" --body "$body"
+          fi
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPOSITORY" --add-label agent:triaged
+          gh api --method DELETE "repos/$REPOSITORY/issues/$ISSUE_NUMBER/labels/agent%3Aanalyze" || true
+          gh api --method DELETE "repos/$REPOSITORY/issues/$ISSUE_NUMBER/labels/agent%3Aretriage" || true
+          if [[ "$needs_info" == "true" ]]; then
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPOSITORY" --add-label needs:info
+          else
+            gh api --method DELETE "repos/$REPOSITORY/issues/$ISSUE_NUMBER/labels/needs%3Ainfo" || true
+          fi
+          if [[ "$candidate" != "true" ]]; then
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPOSITORY" --add-label agent:blocked
+          else
+            gh api --method DELETE "repos/$REPOSITORY/issues/$ISSUE_NUMBER/labels/agent%3Ablocked" || true
+          fi
+      - name: Update VikingForge state
+        env:
+          CALLBACK_URL: ${{ secrets.VIKING_FORGE_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.VIKING_FORGE_CALLBACK_SECRET }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          stage=$(jq -r 'if .candidate then "waiting_approval" else "blocked" end' triage.json)
+          payload=$(jq -c --arg event_id "triage:${RUN_ID}" --arg run_id "$RUN_ID" --arg stage "$stage" --arg run_url "$RUN_URL" '{event_id:$event_id,run_id:$run_id,issue_number:.issue_number,issue_revision:.issue_revision,stage:$stage,github_run_url:$run_url}' issue-context.json)
+          payload=$(jq -c --argjson context "$payload" '. + $context' triage.json)
+          python automation/viking-forge/scripts/post_callback.py --url "$CALLBACK_URL/callbacks/workflow" --secret "$CALLBACK_SECRET" --payload "$payload"

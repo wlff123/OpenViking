@@ -1,0 +1,288 @@
+name: Agent Fix
+
+on:
+  issues:
+    types: [labeled]
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-fix-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+      base_sha: ${{ steps.check.outputs.base_sha }}
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          LABEL: ${{ github.event.label.name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          authorized=false
+          permission=$(gh api "repos/$REPOSITORY/collaborators/$ACTOR/permission" --jq .permission)
+          labels=$(gh issue view "$ISSUE_NUMBER" --repo "$REPOSITORY" --json labels --jq '[.labels[].name]')
+          if [[ "$LABEL" == "agent:ready" && "$permission" =~ ^(admin|maintain|write)$ ]]; then
+            if jq -e 'index("agent:triaged") and (index("agent:blocked") | not) and (index("needs:info") | not) and (index("agent:human-only") | not) and (index("agent:pr-open") | not) and (index("agent:claimed") | not)' <<< "$labels" >/dev/null; then
+              authorized=true
+            fi
+          fi
+          base_sha=$(gh api "repos/$REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)
+          echo "authorized=$authorized" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+  generate:
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.authorize.outputs.base_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.VIKING_FORGE_APP_ID }}
+          private-key: ${{ secrets.VIKING_FORGE_PRIVATE_KEY }}
+      - name: Build trusted inputs and claim Issue
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          CALLBACK_URL: ${{ secrets.VIKING_FORGE_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.VIKING_FORGE_CALLBACK_SECRET }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python automation/viking-forge/scripts/issue_context.py --output issue-context.json
+          triage=$(gh issue view "$ISSUE_NUMBER" --repo "$REPOSITORY" --json comments --jq '[.comments[].body | select(contains("<!-- viking-forge-triage -->"))] | last // ""')
+          jq -n --arg summary "$triage" '{summary:$summary}' > triage.json
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPOSITORY" --add-label agent:claimed
+          for stage in claimed coding; do
+            payload=$(jq -c --arg event_id "fix:${RUN_ID}:${stage}" --arg run_id "$RUN_ID" --arg stage "$stage" --arg run_url "$RUN_URL" '{event_id:$event_id,run_id:$run_id,issue_number:.issue_number,issue_revision:.issue_revision,stage:$stage,github_run_url:$run_url}' issue-context.json)
+            python automation/viking-forge/scripts/post_callback.py --url "$CALLBACK_URL/callbacks/workflow" --secret "$CALLBACK_SECRET" --payload "$payload"
+          done
+      - name: Run Codex fix
+        uses: openai/codex-action@b11346a6fa031e2e164ab4b7c7ea201afffd7d59 # v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: automation/viking-forge/prompts/fix.md
+          output-schema-file: automation/viking-forge/schemas/fix.json
+          output-file: fix.json
+          working-directory: ${{ github.workspace }}
+          permission-profile: ':workspace'
+          model: ${{ vars.VIKING_FORGE_CODEX_MODEL }}
+          effort: ${{ vars.VIKING_FORGE_CODEX_EFFORT }}
+      - name: Enforce patch policy
+        env:
+          BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
+        run: |
+          git add -N .
+          python automation/viking-forge/scripts/guard_patch.py --base "$BASE_SHA" > guard.json
+          git diff --binary --full-index "$BASE_SHA" -- > fix.patch
+          test -s fix.patch
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fix-${{ github.run_id }}
+          path: |
+            fix.patch
+            fix.json
+            guard.json
+            issue-context.json
+          if-no-files-found: error
+          retention-days: 7
+
+  validate:
+    needs: [authorize, generate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.authorize.outputs.base_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: fix-${{ github.run_id }}
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          enable-cache: true
+      - name: Install trusted dependencies before applying patch
+        run: |
+          uv sync --frozen --extra test --extra dev
+          if jq -e '[.files[].path] | all(startswith("docs/"))' guard.json >/dev/null; then
+            npm ci --prefix docs
+          fi
+      - name: Apply and validate patch
+        env:
+          BASE_SHA: ${{ needs.authorize.outputs.base_sha }}
+          CALLBACK_URL: ${{ secrets.VIKING_FORGE_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.VIKING_FORGE_CALLBACK_SECRET }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          payload=$(jq -c --arg event_id "fix:${RUN_ID}:validating" --arg run_id "$RUN_ID" --arg run_url "$RUN_URL" '{event_id:$event_id,run_id:$run_id,issue_number:.issue_number,issue_revision:.issue_revision,stage:"validating",github_run_url:$run_url}' issue-context.json)
+          python automation/viking-forge/scripts/post_callback.py --url "$CALLBACK_URL/callbacks/workflow" --secret "$CALLBACK_SECRET" --payload "$payload"
+          git apply --index fix.patch
+          python automation/viking-forge/scripts/guard_patch.py --base "$BASE_SHA" > validated-guard.json
+          files=$(jq -c '[.files[].path]' validated-guard.json)
+          python automation/viking-forge/scripts/validate_patch.py --files-json "$files" --output validation.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: validation-${{ github.run_id }}
+          path: validation.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [authorize, generate, validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.authorize.outputs.base_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: fix-${{ github.run_id }}
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: validation-${{ github.run_id }}
+      - id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.VIKING_FORGE_APP_ID }}
+          private-key: ${{ secrets.VIKING_FORGE_PRIVATE_KEY }}
+      - name: Recheck Issue revision and create draft PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          CALLBACK_URL: ${{ secrets.VIKING_FORGE_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.VIKING_FORGE_CALLBACK_SECRET }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api "repos/$REPOSITORY/issues/$ISSUE_NUMBER" > live-issue.json
+          live_revision=$(python -c 'import hashlib,json; x=json.load(open("live-issue.json")); value=str(x.get("title") or "")+"\0"+str(x.get("body") or ""); print(hashlib.sha256(value.encode()).hexdigest())')
+          expected_revision=$(jq -r .issue_revision issue-context.json)
+          [[ "$live_revision" == "$expected_revision" ]] || { echo "Issue changed after approval"; exit 1; }
+          payload=$(jq -c --arg event_id "fix:${RUN_ID}:publishing" --arg run_id "$RUN_ID" --arg run_url "$RUN_URL" '{event_id:$event_id,run_id:$run_id,issue_number:.issue_number,issue_revision:.issue_revision,stage:"publishing",github_run_url:$run_url}' issue-context.json)
+          python automation/viking-forge/scripts/post_callback.py --url "$CALLBACK_URL/callbacks/workflow" --secret "$CALLBACK_SECRET" --payload "$payload"
+          git apply --index fix.patch
+          branch="agent/issue-${ISSUE_NUMBER}-${RUN_ID}"
+          git switch -c "$branch"
+          git config user.name "viking-forge[bot]"
+          git config user.email "viking-forge[bot]@users.noreply.github.com"
+          git commit -m "fix: resolve issue #${ISSUE_NUMBER}"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git"
+          git push origin "$branch"
+          summary=$(jq -r .summary fix.json)
+          pr_url=$(gh pr create --repo "$REPOSITORY" --base "$BASE_BRANCH" --head "$branch" --draft --title "Fix #${ISSUE_NUMBER}: ${summary:0:80}" --body "Closes #${ISSUE_NUMBER}\n\n由 VikingForge 生成，等待维护者审核。")
+          gh pr edit "$pr_url" --repo "$REPOSITORY" --add-label agent:generated
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPOSITORY" --add-label agent:pr-open --remove-label agent:ready --remove-label agent:claimed
+          pr_number=${pr_url##*/}
+          validation=$(jq -c . validation.json)
+          payload=$(jq -c --arg event_id "fix:${RUN_ID}:pr" --arg run_id "$RUN_ID" --arg run_url "$RUN_URL" --arg pr_url "$pr_url" --argjson pr_number "$pr_number" --arg validation "$validation" --arg summary "$summary" '{event_id:$event_id,run_id:$run_id,issue_number:.issue_number,issue_revision:.issue_revision,stage:"pr_open",github_run_url:$run_url,pr_url:$pr_url,pr_number:$pr_number,validation:$validation,summary:$summary}' issue-context.json)
+          python automation/viking-forge/scripts/post_callback.py --url "$CALLBACK_URL/callbacks/workflow" --secret "$CALLBACK_SECRET" --payload "$payload"
+
+  report-failure:
+    needs: [authorize, generate, validate, publish]
+    if: always() && needs.authorize.outputs.authorized == 'true' && (needs.generate.result == 'failure' || needs.validate.result == 'failure' || needs.publish.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.VIKING_FORGE_APP_ID }}
+          private-key: ${{ secrets.VIKING_FORGE_PRIVATE_KEY }}
+      - name: Mark blocked and notify
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          CALLBACK_URL: ${{ secrets.VIKING_FORGE_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.VIKING_FORGE_CALLBACK_SECRET }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python automation/viking-forge/scripts/issue_context.py --output issue-context.json
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPOSITORY" --add-label agent:blocked --remove-label agent:claimed
+          payload=$(jq -c --arg event_id "fix:${RUN_ID}:blocked" --arg run_id "$RUN_ID" --arg run_url "$RUN_URL" '{event_id:$event_id,run_id:$run_id,issue_number:.issue_number,issue_revision:.issue_revision,stage:"blocked",github_run_url:$run_url,summary:"自动修复流程失败，请查看工作流日志"}' issue-context.json)
+          python automation/viking-forge/scripts/post_callback.py --url "$CALLBACK_URL/callbacks/workflow" --secret "$CALLBACK_SECRET" --payload "$payload"
+
+  report-merged:
+    if: github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'agent:generated')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.VIKING_FORGE_APP_ID }}
+          private-key: ${{ secrets.VIKING_FORGE_PRIVATE_KEY }}
+      - name: Record generated PR merge
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          REFERENCE: ${{ github.event.pull_request.body }} ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CALLBACK_URL: ${{ secrets.VIKING_FORGE_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.VIKING_FORGE_CALLBACK_SECRET }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [[ "$REFERENCE" =~ \#([0-9]+) ]] || { echo "Generated PR has no Issue reference"; exit 1; }
+          issue_number=${BASH_REMATCH[1]}
+          gh api "repos/$REPOSITORY/issues/$issue_number" > live-issue.json
+          jq -n --arg repository "$REPOSITORY" --slurpfile issue live-issue.json '{repository:{full_name:$repository},issue:$issue[0]}' > issue-event.json
+          python automation/viking-forge/scripts/issue_context.py --event issue-event.json --output issue-context.json
+          gh api --method DELETE "repos/$REPOSITORY/issues/$issue_number/labels/agent%3Apr-open" || true
+          payload=$(jq -c --arg event_id "merge:${RUN_ID}" --arg run_id "$RUN_ID" --arg run_url "$RUN_URL" --arg pr_url "$PR_URL" --argjson pr_number "$PR_NUMBER" '{event_id:$event_id,run_id:$run_id,issue_number:.issue_number,issue_revision:.issue_revision,stage:"merged",github_run_url:$run_url,pr_url:$pr_url,pr_number:$pr_number,summary:"VikingForge 草稿 PR 已合并"}' issue-context.json)
+          python automation/viking-forge/scripts/post_callback.py --url "$CALLBACK_URL/callbacks/workflow" --secret "$CALLBACK_SECRET" --payload "$payload"
