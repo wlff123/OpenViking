@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 from .app import create_app
 from .config import Config
 from .github import GitHubAppTokenProvider, GitHubClient
 from .notifications import NotificationDispatcher
 from .store import Store
+from .codex import CodexRunner
+from .worker import LocalWorker
+from .workspace import WorkspaceManager
 
 
 config = Config.from_env()
@@ -18,19 +22,50 @@ token_provider = GitHubAppTokenProvider(
     repository=config.repository,
 )
 github = GitHubClient(repository=config.repository, token_provider=token_provider)
-app = create_app(config=config, store=store, github=github, start_background_tasks=False)
+project_root = Path(__file__).resolve().parents[2]
+workspace = WorkspaceManager(
+    config.repository_path,
+    config.runs_directory,
+    config.git_remote,
+    config.base_branch,
+)
+codex = CodexRunner(
+    config.codex_executable,
+    project_root / "prompts",
+    project_root / "schemas",
+)
+worker = LocalWorker(
+    store,
+    workspace,
+    codex,
+    github,
+    base_branch=config.base_branch,
+)
+dispatcher = NotificationDispatcher(store, config.feishu_webhook_url)
+app = create_app(config=config, store=store, github=github)
 
-stop_dispatcher = threading.Event()
+stop_background_tasks = threading.Event()
+
+
+def run_worker() -> None:
+    while not stop_background_tasks.is_set():
+        worked = worker.run_once()
+        if not worked:
+            stop_background_tasks.wait(2)
 
 
 def dispatch_notifications() -> None:
-    dispatcher = NotificationDispatcher(store, config.feishu_webhook_url)
-    while not stop_dispatcher.wait(10):
+    while not stop_background_tasks.wait(10):
         dispatcher.dispatch_once()
 
 
 @app.on_event("startup")
-def start_notification_dispatcher() -> None:
+def start_background_tasks() -> None:
+    threading.Thread(
+        target=run_worker,
+        name="viking-forge-worker",
+        daemon=True,
+    ).start()
     if config.feishu_webhook_url:
         threading.Thread(
             target=dispatch_notifications,
@@ -41,5 +76,5 @@ def start_notification_dispatcher() -> None:
 
 @app.on_event("shutdown")
 def shutdown() -> None:
-    stop_dispatcher.set()
+    stop_background_tasks.set()
     store.close()

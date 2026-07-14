@@ -1,90 +1,61 @@
-# VikingForge MVP 设计
+# VikingForge 本地执行设计
 
 ## 目标
 
-VikingForge 为 `volcengine/OpenViking` 提供一套由维护者把关的 Issue 自动处理流程。新 Issue 不会立即消耗 Codex 资源，而是先进入状态面板，由维护者选择忽略或继续分析。只有选择继续分析后，Codex 才执行只读分诊；只有维护者在 GitHub 添加 `agent:ready` 后，Codex 才能修改代码并创建草稿 PR。
+VikingForge 为 OpenViking 提供“人工接单、Codex 解单、人工合并”的自动化流程。新 Issue 先进入面板，由维护者决定是否消耗 Codex；代码写入和 PR 发布之间存在确定性门禁。
 
-## 核心流程
+## 架构
 
 ```mermaid
 flowchart LR
-    A["新建或重新打开 Issue"] --> B["状态面板 awaiting_decision"]
-    B -->|"忽略"| C["agent:ignored"]
-    B -->|"继续分析"| D["agent:analyze"]
-    D --> E["Codex 只读分诊"]
-    E --> F["维护者查看分诊结果"]
-    F -->|"GitHub 添加 agent:ready"| G["Codex 修复和校验"]
-    G --> H["创建草稿 PR"]
-    H --> I["人工审核和合并"]
+    A[GitHub Issue Webhook] --> B[FastAPI 面板]
+    B --> C[(SQLite 队列)]
+    C --> D[单个本地 Worker]
+    D --> E[独立 Git worktree]
+    E --> F[独立 codex exec]
+    F --> G[补丁门禁和测试]
+    G --> H[GitHub App 发布器]
+    H --> I[草稿 PR]
+    I --> J[飞书通知和人工审核]
 ```
 
-## 人工决策门禁
+服务是一个 Python 进程，包含 FastAPI、SQLite、一个 Worker 线程和可选的飞书通知线程。当前规模只有一个仓库和低频 Issue，不引入 Redis、Celery、PostgreSQL或多 Worker。
 
-- 新建或重新打开的 Issue 仅写入 SQLite 只读模型，初始状态为 `awaiting_decision`。
-- 状态面板列表仅提供两个修改操作：`忽略` 和 `继续分析`。
-- 两个操作必须使用 HTTP POST、Basic Auth 和 CSRF Token。
-- `忽略` 使用短期 GitHub App Token 添加 `agent:ignored`，不调用 Codex。
-- `继续分析` 使用短期 GitHub App Token 添加 `agent:analyze`，由标签事件触发只读分诊。
-- GitHub 是事实来源。SQLite 不能单独确认决策；GitHub API 写入失败时，页面显示错误并保持 `awaiting_decision`。
-- `agent:analyze` 在分诊发布 Job 完成后移除。Issue 内容更新后，维护者可在 GitHub 添加 `agent:retriage` 重新分诊。
-- 修复审批仍使用 GitHub 的 `agent:ready`，不进入状态面板。
+## 工作流
 
-## 状态面板
+1. `issues.opened/reopened` 写入 `awaiting_decision`。
+2. 面板“忽略”添加 `agent:ignored`；“继续分析”添加 `agent:analyze`。
+3. 只有配置的 GitHub App 机器人添加的 `agent:analyze` 才能创建分诊任务。
+4. 分诊任务使用独立 worktree 和临时 Codex 会话，自定义权限配置仅允许读取该 worktree。
+5. 分诊结果更新固定 Issue 评论和标签，状态进入 `waiting_approval`。
+6. 只有具有 write、maintain 或 admin 权限的人添加 `agent:ready` 才能请求修复。
+7. 入队前复核 Issue 修订号、候选结论、信息完整性、风险和排除标签。
+8. 修复任务使用新的 worktree 和新的临时 Codex 会话，自定义权限配置仅允许写入该 worktree。
+9. 门禁限制最多 5 个文件、500 行，禁止工作流、依赖、认证和安全策略修改；Python 修改必须带回归测试。
+10. 验证通过后，服务通过 Git Data API 创建分支和草稿 PR。
+11. `pull_request.closed` 更新 `merged` 或 `closed`，合并时写入飞书 Outbox。
 
-状态面板是紧凑的 Issue 列表，不提供独立详情页。每行显示 Issue 编号、标题、作者、更新时间、机器人状态、分诊摘要、工作流和 PR 链接。只有 `awaiting_decision` 行显示“忽略”和“继续分析”按钮；其他状态只展示结果。
+## 隔离边界
 
-状态值为：
+- Codex 使用部署用户本地 `CODEX_HOME` 登录态，不使用仓库中的 API Key。
+- Codex 子进程只继承 PATH、HOME、CODEX_HOME、语言和证书等白名单变量。
+- Codex 命令默认拒绝宿主文件系统，仅开放当前 worktree、仓库 Git 元数据、验证虚拟环境和 Codex 临时目录；用户配置、规则、应用、Hook、多 Agent、远程插件和联网能力均关闭。
+- 验证进程也使用环境白名单，补丁中的测试代码读不到 GitHub App、Webhook、飞书或面板密钥。
+- GitHub App 安装 Token 只存在于发布器 HTTP 请求中，不写入 Git remote、命令行或 worktree。
+- 每个运行目录为 `RUNS_DIRECTORY/<run_id>/`，任务结束后移除其中的 worktree，保留结构化结果和截断日志。
+- 自动化只创建草稿 PR，不批准、不自动转 Ready、不合并、不绕过分支保护。
 
-`awaiting_decision`、`ignored`、`triaging`、`waiting_approval`、`claimed`、`coding`、`validating`、`publishing`、`pr_open`、`blocked`、`merged`、`closed`。
+## 状态
 
-## 安全边界
+运行状态只有 `queued`、`running`、`succeeded`、`failed`。
 
-- 状态面板服务持有 GitHub App ID 和私钥，但每次操作只签发短期安装 Token。
-- 面板服务仅调用 Issue Label API，不执行仓库代码，也不触发任意工作流。
-- Codex 分诊 Job 无文件写权限、GitHub 写权限和直接网络权限。
-- Codex 修复 Job 无 GitHub 写 Token；发布 Job 仅在确定性校验通过后获得短期 App Token。
-- 所有外部 Action 固定到完整提交 SHA。
-- 草稿 PR 不能自动批准、自动合并或绕过 `main` 分支保护。
+Issue 状态包括 `awaiting_decision`、`ignored`、`triaging`、`waiting_approval`、`claimed`、`coding`、`validating`、`publishing`、`pr_open`、`blocked`、`merged`、`closed`。
 
-## 目录边界
+进程异常退出后，启动时把遗留 `running` 任务标记为 `failed`，对应 Issue 进入 `blocked`，由维护者确认后重新分诊或重新授权修复，不从发布中间阶段盲目续跑。同一 Issue 最多有一个活动任务。Codex、Git、门禁、测试或发布失败时，错误写入面板和飞书 Outbox。
 
-除 GitHub 强制要求的工作流入口外，全部代码、测试、部署资源和文档归档在：
+## 已删除的旧架构
 
-```text
-automation/viking-forge/
-├── src/viking_forge/
-├── scripts/
-├── prompts/
-├── schemas/
-├── tests/
-├── deploy/
-├── docs/
-├── pyproject.toml
-└── README.md
-```
-
-GitHub 只能加载仓库根目录下的以下入口：
-
-```text
-.github/workflows/agent-triage.yml
-.github/workflows/agent-fix.yml
-.github/workflows/agent-reconcile.yml
-```
-
-这些入口只编排 `automation/viking-forge/` 中的脚本、提示词和 Schema。
-
-## 部署模型
-
-- GitHub-hosted Runner 运行 Codex、补丁门禁和校验。
-- 单台 Linux 主机通过 Docker Compose 运行 FastAPI 与 Caddy。
-- SQLite Volume 保存状态面板读模型、事件审计和飞书 Outbox。
-- GitHub Webhook 写入状态；每小时对账工作流修复漏事件。
-- 飞书自定义机器人发送 `pr_open`、`blocked` 和 `merged` 通知。
-
-## MVP 不包含
-
-- 面板内批准修复。
-- 自动处理 PR Review 评论。
-- 自动批准或合并 PR。
-- 多仓库、多租户或细粒度 RBAC。
-- Redis、Celery、PostgreSQL 或前端 JavaScript 框架。
+- 不存在 `agent-triage.yml`、`agent-fix.yml`、`agent-reconcile.yml`。
+- 不存在 Workflow 回调、回调共享密钥或每小时 Actions 对账。
+- 不需要 GitHub Actions Secret、Variable 或 OpenAI API Key。
+- 不再用嵌套 Docker 容器运行应用，避免隔离掉宿主用户的 Codex 登录态和仓库。

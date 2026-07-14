@@ -16,6 +16,8 @@ class FakeGitHub:
         self.labels = []
         self.issue = {"state": "open", "title": "<script>alert(1)</script>", "body": "Body"}
         self.error = None
+        self.permission = "write"
+        self.permission_calls = []
 
     def get_issue(self, issue_number):
         if self.error:
@@ -27,6 +29,12 @@ class FakeGitHub:
             raise self.error
         self.labels.append((issue_number, label))
 
+    def get_collaborator_permission(self, login):
+        if self.error:
+            raise self.error
+        self.permission_calls.append(login)
+        return self.permission
+
 
 @pytest.fixture
 def app_parts(tmp_path):
@@ -37,15 +45,20 @@ def app_parts(tmp_path):
         dashboard_password="password",
         dashboard_csrf_secret="csrf-value",
         github_webhook_secret="webhook",
-        callback_secret="callback",
         github_app_id="123",
+        github_app_slug="vikingforge-wlff123",
         github_app_private_key="private-key",
         feishu_webhook_url="",
+        repository_path=str(tmp_path / "repository"),
+        runs_directory=str(tmp_path / "runs"),
+        git_remote="fork",
+        base_branch="main",
+        codex_executable="codex",
     )
     store = Store(config.database_path)
     store.initialize()
     github = FakeGitHub()
-    app = create_app(config=config, store=store, github=github, start_background_tasks=False)
+    app = create_app(config=config, store=store, github=github)
     yield TestClient(app), store, github
     store.close()
 
@@ -74,6 +87,14 @@ def test_health_is_public(app_parts):
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_callback_routes_are_removed(app_parts):
+    client, _, _ = app_parts
+
+    paths = {route.path for route in client.app.routes}
+
+    assert not any(path.startswith("/callbacks/") for path in paths)
 
 
 def test_dashboard_requires_auth_and_escapes_issue_title(app_parts):
@@ -201,6 +222,50 @@ def test_signed_github_webhook_adds_pending_issue(app_parts):
     assert store.get_issue(21)["bot_state"] == "awaiting_decision"
 
 
+def test_ready_webhook_checks_permission_and_queues_local_fix(app_parts):
+    client, store, github = app_parts
+    add_issue(store, 23)
+    store.transition_issue(23, "triaging", event_type="analysis_requested")
+    store.update_issue_metadata(
+        23,
+        triage={"candidate": True, "needs_info": False, "risk_flags": []},
+    )
+    store.transition_issue(23, "waiting_approval", event_type="triage_complete")
+    payload = {
+        "action": "labeled",
+        "repository": {"full_name": "volcengine/OpenViking"},
+        "issue": {
+            "number": 23,
+            "title": "<script>alert(1)</script>",
+            "body": "Body",
+            "html_url": "https://github.com/volcengine/OpenViking/issues/23",
+            "state": "open",
+            "user": {"login": "reporter"},
+            "labels": [{"name": "agent:ready"}],
+        },
+        "label": {"name": "agent:ready"},
+        "sender": {"login": "maintainer"},
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    signature = "sha256=" + hmac.new(b"webhook", body, hashlib.sha256).hexdigest()
+
+    response = client.post(
+        "/webhooks/github",
+        content=body,
+        headers={
+            "X-GitHub-Event": "issues",
+            "X-GitHub-Delivery": "delivery-ready-23",
+            "X-Hub-Signature-256": signature,
+        },
+    )
+
+    assert response.status_code == 200
+    assert github.permission_calls == ["maintainer"]
+    issue = store.get_issue(23)
+    assert issue["bot_state"] == "claimed"
+    assert store.get_run(issue["active_run_id"])["kind"] == "fix"
+
+
 def test_webhook_rejects_invalid_signature(app_parts):
     client, _, _ = app_parts
 
@@ -218,34 +283,6 @@ def test_webhook_rejects_invalid_signature(app_parts):
     assert response.status_code == 403
 
 
-def test_signed_workflow_callback_updates_state(app_parts):
-    client, store, _ = app_parts
-    add_issue(store, 22)
-    store.transition_issue(22, "triaging", event_type="analysis_requested")
-    revision = store.get_issue(22)["revision"]
-    payload = {
-        "event_id": "triage:22:done",
-        "issue_number": 22,
-        "issue_revision": revision,
-        "stage": "waiting_approval",
-        "summary": "Small parser fix",
-    }
-    body = json.dumps(payload, separators=(",", ":")).encode()
-    signature = hmac.new(b"callback", body, hashlib.sha256).hexdigest()
-
-    response = client.post(
-        "/callbacks/workflow",
-        content=body,
-        headers={
-            "Content-Type": "application/json",
-            "X-Viking-Forge-Signature": signature,
-        },
-    )
-
-    assert response.status_code == 200
-    assert store.get_issue(22)["bot_state"] == "waiting_approval"
-
-
 def test_dashboard_uses_readable_chinese_actions(app_parts):
     client, store, _ = app_parts
     add_issue(store)
@@ -254,53 +291,3 @@ def test_dashboard_uses_readable_chinese_actions(app_parts):
 
     assert "忽略" in response.text
     assert "继续分析" in response.text
-
-
-def test_signed_reconcile_callback_applies_github_snapshot(app_parts):
-    client, store, _ = app_parts
-    payload = {
-        "snapshot_id": "reconcile:123",
-        "issues": [
-            {
-                "issue_number": 31,
-                "revision": "revision-31",
-                "title": "Reconciled issue",
-                "issue_url": "https://github.com/volcengine/OpenViking/issues/31",
-                "author": "reporter",
-                "github_state": "open",
-                "bot_state": "waiting_approval",
-                "pr_number": None,
-                "pr_url": None,
-            }
-        ],
-    }
-    body = json.dumps(payload, separators=(",", ":")).encode()
-    signature = hmac.new(b"callback", body, hashlib.sha256).hexdigest()
-
-    response = client.post(
-        "/callbacks/reconcile",
-        content=body,
-        headers={
-            "Content-Type": "application/json",
-            "X-Viking-Forge-Signature": signature,
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"status": "applied"}
-    assert store.get_issue(31)["bot_state"] == "waiting_approval"
-
-
-def test_reconcile_callback_is_idempotent(app_parts):
-    client, _, _ = app_parts
-    payload = {"snapshot_id": "reconcile:same", "issues": []}
-    body = json.dumps(payload, separators=(",", ":")).encode()
-    signature = hmac.new(b"callback", body, hashlib.sha256).hexdigest()
-    headers = {"X-Viking-Forge-Signature": signature}
-
-    assert client.post("/callbacks/reconcile", content=body, headers=headers).json() == {
-        "status": "applied"
-    }
-    assert client.post("/callbacks/reconcile", content=body, headers=headers).json() == {
-        "status": "ignored"
-    }

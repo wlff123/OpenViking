@@ -12,7 +12,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .config import Config
-from .callbacks import CallbackConflict, apply_workflow_callback
 from .security import compute_issue_revision, verify_hmac_signature
 from .store import Store
 from .webhooks import apply_github_event
@@ -23,15 +22,15 @@ class GitHubDecisions(Protocol):
 
     def add_label(self, issue_number: int, label: str) -> None: ...
 
+    def get_collaborator_permission(self, login: str) -> str: ...
+
 
 def create_app(
     *,
     config: Config,
     store: Store,
     github: GitHubDecisions,
-    start_background_tasks: bool = True,
 ) -> FastAPI:
-    del start_background_tasks
     package_dir = Path(__file__).parent
     templates = Jinja2Templates(directory=package_dir / "templates")
     security = HTTPBasic(auto_error=False)
@@ -77,56 +76,33 @@ def create_app(
             payload = json.loads(body)
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+        actor_can_write = False
+        label = payload.get("label", {}).get("name")
+        if (
+            event_type == "issues"
+            and payload.get("action") == "labeled"
+            and label in {"agent:ready", "agent:retriage"}
+        ):
+            login = str(payload.get("sender", {}).get("login", ""))
+            try:
+                permission = github.get_collaborator_permission(login)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=502, detail="GitHub permission check failed"
+                ) from exc
+            actor_can_write = permission in {"admin", "maintain", "write"}
         result = apply_github_event(
             store,
             event_type,
             delivery_id,
             payload,
+            trusted_app_login=f"{config.github_app_slug}[bot]",
+            actor_can_write=actor_can_write,
             repository=config.repository,
         )
         if result == "rejected":
-            raise HTTPException(status_code=403, detail="Unexpected repository")
+            raise HTTPException(status_code=403, detail="Rejected GitHub event")
         return {"status": result}
-
-    @app.post("/callbacks/workflow")
-    async def workflow_callback(request: Request) -> dict[str, str]:
-        body = await request.body()
-        if not verify_hmac_signature(
-            config.callback_secret.encode(),
-            body,
-            request.headers.get("X-Viking-Forge-Signature"),
-        ):
-            raise HTTPException(status_code=403, detail="Invalid callback signature")
-        try:
-            payload = json.loads(body)
-            result = apply_workflow_callback(store, payload)
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=400, detail="Invalid callback") from exc
-        except CallbackConflict as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"status": result}
-
-    @app.post("/callbacks/reconcile")
-    async def reconcile_callback(request: Request) -> dict[str, str]:
-        body = await request.body()
-        if not verify_hmac_signature(
-            config.callback_secret.encode(),
-            body,
-            request.headers.get("X-Viking-Forge-Signature"),
-        ):
-            raise HTTPException(status_code=403, detail="Invalid callback signature")
-        try:
-            payload = json.loads(body)
-            snapshot_id = str(payload["snapshot_id"])
-            issues = payload["issues"]
-            if not isinstance(issues, list):
-                raise TypeError("issues must be a list")
-            if not store.record_delivery(f"reconcile:{snapshot_id}", "reconcile_snapshot"):
-                return {"status": "ignored"}
-            store.apply_snapshot(issues)
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=400, detail="Invalid snapshot") from exc
-        return {"status": "applied"}
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard(
@@ -135,6 +111,12 @@ def create_app(
         _username: str = Depends(require_auth),
     ) -> HTMLResponse:
         issues = store.list_issues(state)
+        for issue in issues:
+            try:
+                triage = json.loads(issue["triage_json"] or "{}")
+                issue["triage_summary"] = triage.get("summary", "-")
+            except json.JSONDecodeError:
+                issue["triage_summary"] = "-"
         return templates.TemplateResponse(
             request=request,
             name="index.html",

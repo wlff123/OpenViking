@@ -4,5 +4,6 @@
 
 判断该 Issue 是否信息充分、能否由小范围代码修改解决，以及是否涉及认证、权限、依赖、构建、工作流、大规模重构或其他高风险区域。只有问题明确、预计改动不超过 5 个文件和 500 行、且能补充回归测试时，`candidate` 才可为 `true`。
 
-最终回复必须只包含符合 `schemas/triage.json` 的 JSON，不要使用 Markdown 代码块。
+`risk_flags` 只记录会阻止自动修复的高风险因素，不记录可由聚焦回归测试覆盖的普通影响范围。`risk_flags` 非空时，`candidate` 必须为 `false`；`candidate` 为 `true` 时，`risk_flags` 必须为空。
 
+最终回复必须只包含符合 `schemas/triage.json` 的 JSON，不要使用 Markdown 代码块。

@@ -60,27 +60,6 @@ def test_delivery_ids_are_idempotent(store):
     assert store.record_delivery("github:abc", "issues") is False
 
 
-def test_snapshot_reconciles_state_without_transition_history(store):
-    snapshot = {
-        "issue_number": 9,
-        "revision": "live-revision",
-        "title": "Live title",
-        "issue_url": "https://example.test/9",
-        "author": "reporter",
-        "github_state": "open",
-        "bot_state": "pr_open",
-        "pr_number": 17,
-        "pr_url": "https://example.test/pull/17",
-    }
-
-    store.apply_snapshot([snapshot])
-
-    issue = store.get_issue(9)
-    assert issue["bot_state"] == "pr_open"
-    assert issue["pr_number"] == 17
-    assert issue["pr_url"] == "https://example.test/pull/17"
-
-
 def test_closed_issue_can_be_confirmed_as_merged(store):
     store.upsert_issue(10, "rev", "Title", "https://example.test/10", "user", "open")
     store.transition_issue(10, "closed", event_type="issue_closed")
@@ -88,3 +67,120 @@ def test_closed_issue_can_be_confirmed_as_merged(store):
     store.transition_issue(10, "merged", event_type="generated_pr_merged")
 
     assert store.get_issue(10)["bot_state"] == "merged"
+
+
+def test_enqueue_run_changes_issue_state_atomically(store):
+    store.upsert_issue(11, "rev-11", "Title", "https://example.test/11", "user", "open")
+
+    run_id = store.enqueue_run(11, "triage", "triaging")
+
+    issue = store.get_issue(11)
+    run = store.get_run(run_id)
+    assert issue["bot_state"] == "triaging"
+    assert issue["active_run_id"] == run_id
+    assert run["issue_number"] == 11
+    assert run["issue_revision"] == "rev-11"
+    assert run["kind"] == "triage"
+    assert run["status"] == "queued"
+
+
+def test_enqueue_rejects_duplicate_active_run(store):
+    store.upsert_issue(12, "rev-12", "Title", "https://example.test/12", "user", "open")
+    store.enqueue_run(12, "triage", "triaging")
+
+    with pytest.raises(RuntimeError, match="active run"):
+        store.enqueue_run(12, "triage", "waiting_approval")
+
+
+def test_claim_run_is_fifo(store):
+    for issue_number in (13, 14):
+        store.upsert_issue(
+            issue_number,
+            f"rev-{issue_number}",
+            "Title",
+            f"https://example.test/{issue_number}",
+            "user",
+            "open",
+        )
+    first = store.enqueue_run(13, "triage", "triaging")
+    second = store.enqueue_run(14, "triage", "triaging")
+
+    assert store.claim_run(now=100)["run_id"] == first
+    assert store.claim_run(now=101)["run_id"] == second
+    assert store.claim_run(now=102) is None
+
+
+def test_finish_run_clears_active_run(store):
+    store.upsert_issue(15, "rev-15", "Title", "https://example.test/15", "user", "open")
+    run_id = store.enqueue_run(15, "triage", "triaging")
+    store.claim_run(now=100)
+
+    store.finish_run(run_id, "succeeded", result={"candidate": True})
+
+    assert store.get_issue(15)["active_run_id"] is None
+    run = store.get_run(run_id)
+    assert run["status"] == "succeeded"
+    assert run["result"] == {"candidate": True}
+
+
+def test_initialize_blocks_interrupted_run_for_manual_retry(tmp_path):
+    database_path = tmp_path / "forge.sqlite3"
+    first_store = Store(database_path)
+    first_store.initialize()
+    first_store.upsert_issue(16, "rev-16", "Title", "https://example.test/16", "user", "open")
+    run_id = first_store.enqueue_run(16, "triage", "triaging")
+    first_store.claim_run(now=100)
+    first_store.close()
+
+    recovered_store = Store(database_path)
+    recovered_store.initialize()
+    try:
+        run = recovered_store.get_run(run_id)
+        issue = recovered_store.get_issue(16)
+        assert run["status"] == "failed"
+        assert "restart" in run["error"].lower()
+        assert issue["bot_state"] == "blocked"
+        assert issue["active_run_id"] is None
+        assert recovered_store.claim_run(now=200) is None
+    finally:
+        recovered_store.close()
+
+
+def test_enqueue_rolls_back_when_transition_is_invalid(store):
+    store.upsert_issue(17, "rev-17", "Title", "https://example.test/17", "user", "open")
+
+    with pytest.raises(InvalidTransition):
+        store.enqueue_run(17, "fix", "claimed")
+
+    assert store.get_issue(17)["active_run_id"] is None
+    count = store.connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    assert count == 0
+
+
+def test_record_pr_open_persists_state_metadata_and_notification(store):
+    store.upsert_issue(18, "rev", "Title", "https://example.test/18", "user", "open")
+    for state in ("triaging", "waiting_approval"):
+        store.transition_issue(18, state, event_type=f"entered_{state}")
+    run_id = store.enqueue_run(18, "fix", "claimed")
+    store.claim_run()
+    for state in ("coding", "validating", "publishing"):
+        store.transition_issue(18, state, event_type=f"entered_{state}", run_id=run_id)
+    payload = {"issue_number": 18, "pr_url": "https://example.test/pull/20"}
+
+    store.record_pr_open(
+        18,
+        run_id,
+        20,
+        "https://example.test/pull/20",
+        payload,
+        run_result={"codex": {"summary": "fixed"}},
+    )
+
+    issue = store.get_issue(18)
+    assert issue["bot_state"] == "pr_open"
+    assert issue["pr_number"] == 20
+    assert issue["active_run_id"] is None
+    assert store.get_run(run_id)["status"] == "succeeded"
+    notification = store.get_notification(run_id, "pr_open")
+    assert notification is not None
+    assert notification["payload_json"]

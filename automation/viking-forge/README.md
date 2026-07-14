@@ -1,24 +1,37 @@
 # VikingForge
 
-VikingForge 是 OpenViking 的人工把关 Issue 自动处理系统。它接收 GitHub Issue Webhook，在网页面板列出待处理项；维护者选择“忽略”或“继续分析”后，GitHub Actions 才会调用 Codex 分诊。维护者随后在 GitHub 添加 `agent:ready`，Codex 才会生成修复、执行策略校验并创建草稿 PR。系统通过飞书通知维护者审核，不自动合并。
+VikingForge 是 OpenViking 的人工把关 Issue 自动处理服务。GitHub 负责 Issue、标签、分支和 PR；维护者本地机器负责 Codex 分诊、代码修改、验证和发布。GitHub Actions 不运行 Codex，也不保存 OpenAI API Key、GitHub App 私钥或飞书 Webhook。
+
+## 最终效果
+
+1. 新 Issue 出现在网页面板，初始状态为 `awaiting_decision`，不会自动调用 Codex。
+2. 维护者在面板选择“忽略”或“继续分析”。
+3. “继续分析”会在本机启动一个只读 Codex 会话，结果写入 Issue 评论。
+4. 维护者确认分诊结论后，在 GitHub 添加 `agent:ready`。
+5. 本机为该 Issue 创建新的 worktree 和新的 Codex 会话，修改代码并运行门禁与测试。
+6. 验证通过后，GitHub App 创建分支和草稿 PR，飞书通知维护者审核。
+7. 系统不会自动批准、转为 Ready、合并或发布 PR。
+
+不同 Issue 使用不同运行记录、worktree 和 Codex 会话；单个 Worker 串行执行，避免任务互相污染。
 
 ## 目录
 
-- `src/viking_forge/`：面板、Webhook、状态存储、回调和飞书通知。
-- `scripts/`：Actions 使用的上下文、策略、验证、回调和对账脚本。
-- `prompts/`、`schemas/`：Codex 提示词与结构化输出约束。
-- `deploy/`：Docker Compose、Caddy 和环境变量样例。
-- `docs/design.md`：系统设计和状态流转。
-- `docs/deployment.md`：完整部署及 GitHub 配置步骤。
-- `.github/workflows/agent-*.yml`：仓库级触发入口，是唯一放在本目录之外的文件。
+- `src/viking_forge/`：Webhook、面板、SQLite 队列、Worker、GitHub 发布和飞书通知。
+- `prompts/`、`schemas/`：Codex 分诊与修复提示词及结构化输出约束。
+- `scripts/labels.py`：初始化 GitHub 标签。
+- `deploy/`：本地环境变量样例和 systemd 服务单元。
+- `docs/design.md`：已落地架构与安全边界。
+- `docs/deployment.md`：部署、GitHub 配置、使用和恢复步骤。
 
-## 本地测试
+## 验证
 
 ```bash
 cd automation/viking-forge
 uv sync --extra test
-uv run pytest
+uv run pytest -q
+uv run ruff check src tests scripts
+uv run ruff format --check src tests scripts
+codex login status
 ```
 
-生产部署参见 [docs/deployment.md](docs/deployment.md)。
-
+部署和实际使用参见 [部署文档](docs/deployment.md)。

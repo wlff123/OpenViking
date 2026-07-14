@@ -19,7 +19,7 @@ def _text(value: Any, limit: int = 1200) -> str:
 def build_card(notification_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     if notification_type not in SUPPORTED_TYPES:
         raise ValueError(f"Unsupported notification type: {notification_type}")
-    target_url = payload.get("pr_url") or payload.get("workflow_url") or payload.get("issue_url")
+    target_url = payload.get("pr_url") or payload.get("issue_url")
     return {
         "msg_type": "interactive",
         "card": {

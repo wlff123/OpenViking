@@ -1,5 +1,4 @@
 import json
-import re
 from pathlib import Path
 
 
@@ -25,80 +24,65 @@ def test_codex_schemas_are_valid_and_closed():
         assert schema["additionalProperties"] is False
 
 
-def test_triage_workflow_requires_human_analysis_label():
-    workflow = (REPOSITORY / ".github/workflows/agent-triage.yml").read_text()
+def test_triage_prompt_keeps_candidate_and_risk_flags_consistent():
+    prompt = (PROJECT / "prompts" / "triage.md").read_text()
 
-    assert "issues:" in workflow
-    assert "types: [labeled]" in workflow
-    assert "opened" not in workflow
-    assert "reopened" not in workflow
-    assert "agent:analyze" in workflow
-    assert "agent:retriage" in workflow
-    assert "automation/viking-forge/prompts/triage.md" in workflow
+    assert "risk_flags` 非空时，`candidate` 必须为 `false`" in prompt
 
 
-def test_triage_workflow_allows_only_the_viking_forge_bot():
-    workflow = (REPOSITORY / ".github/workflows/agent-triage.yml").read_text()
+def test_fix_prompt_uses_prepared_validation_environment():
+    prompt = (PROJECT / "prompts" / "fix.md").read_text()
 
-    assert "allow-bot-users: ${{ vars.VIKING_FORGE_APP_SLUG }}[bot]" in workflow
-    assert "allow-bot-users: true" not in workflow
-
-
-def test_fix_workflow_creates_only_draft_prs_after_guard():
-    workflow = (REPOSITORY / ".github/workflows/agent-fix.yml").read_text()
-
-    assert "agent:ready" in workflow
-    assert "guard_patch.py" in workflow
-    assert "--draft" in workflow
-    assert "agent:generated" in workflow
-    assert "persist-credentials: false" in workflow
+    assert "VALIDATION_VENV" in prompt
 
 
-def test_reconciliation_runs_hourly_without_codex():
-    workflow = (REPOSITORY / ".github/workflows/agent-reconcile.yml").read_text()
+def test_github_actions_execution_assets_are_removed():
+    for name in ("agent-triage.yml", "agent-fix.yml", "agent-reconcile.yml"):
+        assert not (REPOSITORY / ".github" / "workflows" / name).exists()
+    for name in ("issue_context.py", "post_callback.py", "reconcile.py"):
+        assert not (PROJECT / "scripts" / name).exists()
+    assert not (PROJECT / "src" / "viking_forge" / "callbacks.py").exists()
 
-    assert "workflow_dispatch:" in workflow
-    assert "cron: '17 * * * *'" in workflow
-    assert "reconcile.py" in workflow
-    assert "codex-action" not in workflow
 
+def test_runtime_uses_one_local_worker_and_no_callback_secret():
+    main = (PROJECT / "src" / "viking_forge" / "main.py").read_text()
+    config = (PROJECT / "src" / "viking_forge" / "config.py").read_text()
 
-def test_external_actions_are_pinned_to_full_sha():
-    workflows = "\n".join(
-        path.read_text() for path in (REPOSITORY / ".github/workflows").glob("agent-*.yml")
-    )
-    action_refs = re.findall(r"uses:\s+[^\s@]+@([^\s#]+)", workflows)
-
-    assert action_refs
-    assert all(re.fullmatch(r"[0-9a-f]{40}", value) for value in action_refs)
+    assert "LocalWorker" in main
+    assert 'name="viking-forge-worker"' in main
+    assert "CALLBACK_SECRET" not in config
+    assert "callback_secret" not in config
 
 
 def test_deployment_assets_stay_in_viking_forge_directory():
     for relative in (
-        ".dockerignore",
-        "deploy/Dockerfile",
-        "deploy/docker-compose.yml",
-        "deploy/Caddyfile",
         "deploy/.env.example",
+        "deploy/viking-forge.service",
         "docs/deployment.md",
         "README.md",
     ):
         assert (PROJECT / relative).is_file(), relative
 
 
-def test_docker_context_uses_a_source_allowlist():
-    dockerignore = (PROJECT / ".dockerignore").read_text()
+def test_obsolete_container_deployment_assets_are_removed():
+    for relative in (
+        ".dockerignore",
+        "deploy/Dockerfile",
+        "deploy/docker-compose.yml",
+        "deploy/Caddyfile",
+    ):
+        assert not (PROJECT / relative).exists(), relative
 
-    assert dockerignore.startswith("*\n")
-    assert "!src/**" in dockerignore
-    assert "!.env" not in dockerignore
 
+def test_local_service_runs_as_wlf1_with_local_codex_state():
+    service = (PROJECT / "deploy" / "viking-forge.service").read_text()
+    environment = (PROJECT / "deploy" / ".env.example").read_text()
 
-def test_docker_image_prepares_writable_data_directory():
-    dockerfile = (PROJECT / "deploy/Dockerfile").read_text()
-
-    prepare_data = dockerfile.index("mkdir -p /data")
-    run_as_app = dockerfile.index("USER app")
-
-    assert prepare_data < run_as_app
-    assert "chown app:app /data" in dockerfile
+    assert "User=wlf1" in service
+    assert "viking_forge.main:app" in service
+    assert "CODEX_HOME=/home/wlf1/.codex" in service
+    assert "REPOSITORY_PATH=" in environment
+    assert "RUNS_DIRECTORY=" in environment
+    assert "GITHUB_APP_PRIVATE_KEY_FILE=" in environment
+    assert "OPENAI_API_KEY" not in environment
+    assert "CALLBACK_SECRET" not in environment
