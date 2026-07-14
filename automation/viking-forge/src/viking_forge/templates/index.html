@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VikingForge</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>VikingForge</h1>
+        <p>OpenViking Issue 处理队列</p>
+      </div>
+      <nav>
+        <a href="/">全部</a>
+        <a href="/?state=awaiting_decision">待决定</a>
+        <a href="/?state=blocked">已阻塞</a>
+      </nav>
+    </header>
+    <main>
+      <table>
+        <thead>
+          <tr>
+            <th>Issue</th>
+            <th>标题</th>
+            <th>作者</th>
+            <th>状态</th>
+            <th>分诊摘要</th>
+            <th>链接</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for issue in issues %}
+          <tr>
+            <td>#{{ issue.issue_number }}</td>
+            <td>{{ issue.title }}</td>
+            <td>{{ issue.author }}</td>
+            <td><span class="status status-{{ issue.bot_state }}">{{ issue.bot_state }}</span></td>
+            <td>{{ issue.triage_json or "-" }}</td>
+            <td class="links">
+              <a href="{{ issue.issue_url }}">Issue</a>
+              {% if issue.workflow_url %}<a href="{{ issue.workflow_url }}">Workflow</a>{% endif %}
+              {% if issue.pr_url %}<a href="{{ issue.pr_url }}">PR</a>{% endif %}
+            </td>
+            <td>
+              {% if issue.bot_state == "awaiting_decision" %}
+              <div class="actions">
+                <form method="post" action="/issues/{{ issue.issue_number }}/decision">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="decision" value="ignore">
+                  <button class="secondary" type="submit">忽略</button>
+                </form>
+                <form method="post" action="/issues/{{ issue.issue_number }}/decision">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="decision" value="analyze">
+                  <button type="submit">继续分析</button>
+                </form>
+              </div>
+              {% else %}-{% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7" class="empty">没有匹配的 Issue</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </main>
+  </body>
+</html>

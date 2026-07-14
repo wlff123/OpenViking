@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["summary", "category", "confidence", "candidate", "needs_info", "risk_flags"],
+  "properties": {
+    "summary": {"type": "string", "minLength": 1, "maxLength": 1200},
+    "category": {
+      "type": "string",
+      "enum": ["bug", "documentation", "enhancement", "question", "unknown"]
+    },
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "candidate": {"type": "boolean"},
+    "needs_info": {"type": "boolean"},
+    "risk_flags": {
+      "type": "array",
+      "items": {"type": "string", "maxLength": 200},
+      "maxItems": 10
+    }
+  },
+  "additionalProperties": false
+}
+
