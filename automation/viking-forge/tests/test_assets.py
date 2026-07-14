@@ -85,3 +85,13 @@ def test_docker_context_uses_a_source_allowlist():
     assert dockerignore.startswith("*\n")
     assert "!src/**" in dockerignore
     assert "!.env" not in dockerignore
+
+
+def test_docker_image_prepares_writable_data_directory():
+    dockerfile = (PROJECT / "deploy/Dockerfile").read_text()
+
+    prepare_data = dockerfile.index("mkdir -p /data")
+    run_as_app = dockerfile.index("USER app")
+
+    assert prepare_data < run_as_app
+    assert "chown app:app /data" in dockerfile
