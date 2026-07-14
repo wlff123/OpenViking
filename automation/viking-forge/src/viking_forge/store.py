@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -90,7 +91,30 @@ class Store:
                 last_error TEXT,
                 PRIMARY KEY(run_id, notification_type)
             );
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                issue_number INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('triage', 'fix')),
+                issue_revision TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'succeeded', 'failed')),
+                result_json TEXT,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER,
+                FOREIGN KEY(issue_number) REFERENCES issues(issue_number)
+            );
             """
+        )
+        now = int(time.time())
+        self._connection.execute(
+            """
+            UPDATE runs
+            SET status = 'queued', started_at = NULL, updated_at = ?
+            WHERE status = 'running'
+            """,
+            (now,),
         )
         self._connection.commit()
 
@@ -224,6 +248,145 @@ class Store:
                 """,
                 (issue_number, run_id, event_type, json.dumps(payload or {}), now),
             )
+
+    def enqueue_run(self, issue_number: int, kind: str, target_state: str) -> str:
+        if kind not in {"triage", "fix"}:
+            raise ValueError(f"Unknown run kind: {kind}")
+        run_id = str(uuid.uuid4())
+        now = int(time.time())
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                issue = self.connection.execute(
+                    """
+                    SELECT revision, bot_state, active_run_id
+                    FROM issues WHERE issue_number = ?
+                    """,
+                    (issue_number,),
+                ).fetchone()
+                if issue is None:
+                    raise KeyError(issue_number)
+                if issue["active_run_id"] is not None:
+                    raise RuntimeError(f"Issue {issue_number} already has an active run")
+                current_state = str(issue["bot_state"])
+                if target_state not in ALLOWED_TRANSITIONS.get(current_state, set()):
+                    raise InvalidTransition(f"{current_state} -> {target_state}")
+                self.connection.execute(
+                    """
+                    INSERT INTO runs(
+                        run_id, issue_number, kind, issue_revision, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'queued', ?, ?)
+                    """,
+                    (run_id, issue_number, kind, issue["revision"], now, now),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE issues
+                    SET bot_state = ?, active_run_id = ?, updated_at = ?
+                    WHERE issue_number = ?
+                    """,
+                    (target_state, run_id, now, issue_number),
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO events(issue_number, run_id, event_type, payload_json, created_at)
+                    VALUES (?, ?, 'run_queued', ?, ?)
+                    """,
+                    (issue_number, run_id, json.dumps({"kind": kind}), now),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+        return run_id
+
+    def claim_run(self, now: int | None = None) -> dict[str, Any] | None:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.connection.execute(
+                    """
+                    SELECT * FROM runs
+                    WHERE status = 'queued'
+                    ORDER BY created_at, rowid
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row is None:
+                    self.connection.commit()
+                    return None
+                self.connection.execute(
+                    """
+                    UPDATE runs
+                    SET status = 'running', started_at = ?, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (timestamp, timestamp, row["run_id"]),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+        return self.get_run(str(row["run_id"]))
+
+    def finish_run(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        if status not in {"succeeded", "failed"}:
+            raise ValueError(f"Invalid terminal run status: {status}")
+        now = int(time.time())
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                run = self.connection.execute(
+                    "SELECT issue_number FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if run is None:
+                    raise KeyError(run_id)
+                self.connection.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?, result_json = ?, error = ?,
+                        finished_at = ?, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        status,
+                        json.dumps(result, ensure_ascii=False) if result is not None else None,
+                        error[-2000:] if error else None,
+                        now,
+                        now,
+                        run_id,
+                    ),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE issues SET active_run_id = NULL, updated_at = ?
+                    WHERE issue_number = ? AND active_run_id = ?
+                    """,
+                    (now, run["issue_number"], run_id),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        run = dict(row)
+        run["result"] = json.loads(run["result_json"]) if run["result_json"] else None
+        return run
 
     def update_issue_metadata(
         self,
