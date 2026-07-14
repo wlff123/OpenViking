@@ -1,14 +1,19 @@
 import hashlib
 import hmac
+import subprocess
 
 import pytest
 
-from scripts.guard_patch import PatchPolicyError, validate_changed_files
 from scripts.issue_context import extract_issue_context
 from scripts.labels import LABELS
 from scripts.post_callback import encode_signed_callback
 from scripts.reconcile import build_snapshot
-from scripts.validate_patch import validation_commands
+from viking_forge.validation import (
+    PatchPolicyError,
+    inspect_changes,
+    validate_changed_files,
+    validation_commands,
+)
 
 
 def test_issue_context_treats_body_as_data():
@@ -71,6 +76,49 @@ def test_guard_accepts_small_python_fix_with_regression_test():
 def test_guard_rejects_unsafe_patch(changed):
     with pytest.raises(PatchPolicyError):
         validate_changed_files(changed)
+
+
+def test_inspect_changes_reads_modified_and_untracked_files(tmp_path):
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    source = tmp_path / "openviking" / "a.py"
+    source.parent.mkdir()
+    source.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=tmp_path, check=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source.write_text("value = 2\n", encoding="utf-8")
+    test_file = tmp_path / "tests" / "test_a.py"
+    test_file.parent.mkdir()
+    test_file.write_text("def test_a():\n    assert True\n", encoding="utf-8")
+
+    changed = inspect_changes(tmp_path, base_sha)
+
+    assert changed == [
+        {
+            "path": "openviking/a.py",
+            "added": 1,
+            "deleted": 1,
+            "binary": False,
+            "status": "M",
+            "mode": "100644",
+        },
+        {
+            "path": "tests/test_a.py",
+            "added": 2,
+            "deleted": 0,
+            "binary": False,
+            "status": "A",
+            "mode": "100644",
+        },
+    ]
 
 
 def test_validation_commands_are_repository_owned():
