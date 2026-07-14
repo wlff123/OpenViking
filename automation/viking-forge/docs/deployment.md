@@ -1,89 +1,166 @@
 # VikingForge 部署与使用
 
-## 1. 最终运行效果
+## 1. 部署完成后会看到什么
 
-1. 社区成员创建 OpenViking Issue，VikingForge Webhook 将其显示为“待决定”，不会调用 Codex。
-2. 维护者登录面板，选择“忽略”或“继续分析”。前者添加 `agent:ignored`，后者添加 `agent:analyze`。
-3. `agent:analyze` 触发只读 Codex 分诊。分诊结果写回带固定标记的 Issue 评论，并添加 `agent:triaged`；信息不足时添加 `needs:info`，不进入修复。
-4. 维护者审核分诊结论，在 GitHub Issue 上添加 `agent:ready`。只有具有仓库写权限的操作者才能通过授权检查。
-5. Codex 在隔离任务中修改代码，策略脚本限制文件和行数；另一个全新检出任务应用补丁并运行检查。
-6. 校验通过后，GitHub App 推送 `agent/issue-<编号>-<run_id>` 分支并创建草稿 PR，添加 `agent:generated`。系统不会自动转为 Ready、合并或发布。
-7. 草稿 PR、阻塞和合并状态通过飞书机器人通知维护者；面板展示 Issue、Workflow 和 PR 链接。
-8. 每小时对账 GitHub 的 Issue/PR 标签状态，修复丢失 Webhook 或短时故障造成的面板状态偏差。
+- `http://127.0.0.1:18081/` 是带 Basic Auth 的 Issue 状态面板，只在 `awaiting_decision` 行显示“忽略”和“继续分析”。
+- 社区新建 Issue 后，面板出现一行记录，但 Codex 不会启动。
+- 点击“继续分析”后，本地出现一个 `triage` 运行，GitHub Issue 收到 VikingForge 分诊评论。
+- 维护者在 GitHub 添加 `agent:ready` 后，本地出现另一个 `fix` 运行；它与分诊使用不同 worktree 和 Codex 会话。
+- 修复成功后，Fork 中出现 `agent/issue-<编号>-<run_id>` 分支和草稿 PR，面板显示 PR 链接，飞书收到审核通知。
+- 最终是否转为 Ready、是否合并，完全由维护者决定。
 
-## 2. 前置条件
+## 2. 当前环境
 
-- 一台可由 GitHub 访问 HTTPS 443 端口的 Linux 主机和域名。
-- Docker Engine 与 Docker Compose v2。
-- OpenViking 仓库管理员权限、OpenAI API Key、飞书群自定义机器人 Webhook。
-- GitHub Actions 允许运行仓库中的三个 `agent-*.yml` 工作流。
+已验证的运行位置：
 
-## 3. 创建 GitHub App
+- 容器：`openeuler00`
+- Linux 用户：`wlf1`
+- 仓库：`/data/wlf1/viking-forge-workspace`
+- 应用：`/data/wlf1/viking-forge-workspace/automation/viking-forge`
+- Codex 登录目录：`/home/wlf1/.codex`
+- 服务端口：`18081`
 
-创建仅安装到 `volcengine/OpenViking` 的 GitHub App：
-
-- Webhook URL：`https://<域名>/webhooks/github`
-- Webhook Secret：生成至少 32 字节随机值。
-- Repository permissions：Metadata 只读；Contents、Issues、Pull requests 读写；Actions、Checks 只读。
-- Subscribe to events：Issues、Pull request、Workflow run。
-
-安装 App 后记录 App ID 和 PEM 私钥。面板使用 App 身份添加 `agent:analyze`，工作流据此区分网页人工决定与外部用户伪造的同名标签。
-
-## 4. 部署服务
+先确认本地 Codex 登录有效：
 
 ```bash
-cd automation/viking-forge/deploy
-cp .env.example .env
-chmod 600 .env
-docker compose up -d --build
-docker compose ps
-curl https://<域名>/healthz
+docker exec -u wlf1 openeuler00 bash -lc 'CODEX_HOME=/home/wlf1/.codex codex login status'
 ```
 
-编辑 `.env`，替换所有示例值。`GITHUB_APP_PRIVATE_KEY` 保持单行，并用字面量 `\n` 表示换行。只运行一个 Uvicorn worker；SQLite 和通知租约按单进程部署设计。Caddy 自动申请 TLS 证书，数据库保存在命名卷 `viking-forge-data`。
+应显示 `Logged in using ChatGPT`。这里不需要 `OPENAI_API_KEY`。
 
-## 5. 配置仓库
+## 3. GitHub App 和 Webhook
 
-在 GitHub 仓库 Actions Secrets 中设置：
+GitHub App 只安装到目标仓库，权限如下：
 
-- `OPENAI_API_KEY`
-- `VIKING_FORGE_APP_ID`
-- `VIKING_FORGE_PRIVATE_KEY`
-- `VIKING_FORGE_CALLBACK_URL`，值为 `https://<域名>`
-- `VIKING_FORGE_CALLBACK_SECRET`，必须与服务端 `CALLBACK_SECRET` 相同
+- Metadata：Read-only
+- Contents：Read and write
+- Issues：Read and write
+- Pull requests：Read and write
 
-在 Actions Variables 中设置：
+记录 App ID、App slug 和 PEM 私钥。PEM 只保存在本地运行目录，权限设为 `600`。
 
-- `VIKING_FORGE_APP_SLUG`：GitHub App 的 slug，不含 `[bot]`
-- `VIKING_FORGE_CODEX_MODEL`：经过验证的 Codex 模型名
-- `VIKING_FORGE_CODEX_EFFORT`：建议 `medium`
+在目标仓库的 Settings -> Webhooks 创建 Webhook：
 
-首次执行以下命令创建或更新标签：
+- Payload URL：公网入口加 `/webhooks/github`
+- Content type：`application/json`
+- Secret：与本地 `GITHUB_WEBHOOK_SECRET` 相同
+- Events：只选 `Issues` 和 `Pull requests`
+
+仓库 Webhook 与 GitHub App Webhook 二选一即可；当前 Fork 使用仓库 Webhook。公网入口可以是固定反向代理或 Tunnel，但必须把请求转发到本地 18081。
+
+GitHub Actions 中不配置任何 VikingForge Secret 或 Variable。若旧版本配置过，应删除：
+
+- Secrets：`OPENAI_API_KEY`、`VIKING_FORGE_APP_ID`、`VIKING_FORGE_PRIVATE_KEY`、`VIKING_FORGE_CALLBACK_URL`、`VIKING_FORGE_CALLBACK_SECRET`
+- Variables：`VIKING_FORGE_APP_SLUG`、`VIKING_FORGE_CODEX_MODEL`、`VIKING_FORGE_CODEX_EFFORT`
+
+## 4. 本地配置
 
 ```bash
-cd automation/viking-forge
-gh auth login
-python scripts/labels.py --repo volcengine/OpenViking
+docker exec -u wlf1 openeuler00 bash -lc '
+  mkdir -p /data/wlf1/viking-forge-runtime/runs
+  chmod 700 /data/wlf1/viking-forge-runtime /data/wlf1/viking-forge-runtime/runs
+  cd /data/wlf1/viking-forge-workspace/automation/viking-forge
+  uv sync --extra test
+'
 ```
 
-在 GitHub App 页面确认 Webhook 最近投递为 2xx，然后手动运行 `Agent Reconcile` 工作流完成初始同步。
+把 `deploy/.env.example` 复制为 `/data/wlf1/viking-forge-runtime/viking-forge.env` 并填写真实值。把 GitHub App PEM 放到：
 
-## 6. 日常使用
+```text
+/data/wlf1/viking-forge-runtime/github-app-private-key.pem
+```
 
-访问 `https://<域名>/`，输入 `.env` 中的面板用户名和密码。面板只对 `awaiting_decision` 状态显示操作：
+两个文件都必须属于 `wlf1` 且权限为 `600`。环境文件中关键路径为：
 
-- “忽略”：添加 `agent:ignored`，不会运行 Codex。
-- “继续分析”：添加 `agent:analyze`，启动一次只读分诊。
+```dotenv
+REPOSITORY=wlff123/OpenViking
+REPOSITORY_PATH=/data/wlf1/viking-forge-workspace
+DATABASE_PATH=/data/wlf1/viking-forge-runtime/viking-forge.sqlite3
+RUNS_DIRECTORY=/data/wlf1/viking-forge-runtime/runs
+GIT_REMOTE=fork
+BASE_BRANCH=main
+CODEX_EXECUTABLE=/usr/local/nvm/versions/node/v25.9.0/bin/codex
+GITHUB_APP_PRIVATE_KEY_FILE=/data/wlf1/viking-forge-runtime/github-app-private-key.pem
+```
 
-分诊完成后到 GitHub 阅读机器人评论。确认值得修复且风险可接受，再添加 `agent:ready`。草稿 PR 只表示自动修复已生成、等待人工审查；维护者需要检查代码、CI 和安全影响，必要时要求修改，最后自行转为 Ready 并合并。
+## 5. 启动
 
-## 7. 运维检查
+支持 systemd 的 Linux 主机使用 `deploy/viking-forge.service`。调整路径后安装：
 
 ```bash
-docker compose logs -f app
-docker compose logs -f caddy
-docker compose exec app python -c "import sqlite3; c=sqlite3.connect('/data/viking-forge.sqlite3'); print(c.execute('select bot_state,count(*) from issues group by bot_state').fetchall())"
+sudo cp deploy/viking-forge.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now viking-forge
+sudo systemctl status viking-forge
 ```
 
-备份 `viking-forge-data` 卷中的 SQLite 数据库。升级前先备份，再执行 `docker compose up -d --build`。若面板状态与 GitHub 不一致，先手动运行 `Agent Reconcile`；不要直接修改数据库。
+当前 `openeuler00` 容器的 PID 1 不是 systemd，直接以 `wlf1` 启动同一命令：
 
+```bash
+set -a
+source /data/wlf1/viking-forge-runtime/viking-forge.env
+set +a
+export CODEX_HOME=/home/wlf1/.codex
+cd /data/wlf1/viking-forge-workspace/automation/viking-forge
+exec uv run uvicorn viking_forge.main:app --host 0.0.0.0 --port 18081
+```
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:18081/healthz
+```
+
+PC 访问容器时，需要把 PC 的 `127.0.0.1:18081` 反向代理到容器的 `18081`。公网 Webhook Tunnel 再指向 PC 的 18081。
+
+## 6. 初始化标签
+
+使用有仓库管理权限的 GitHub CLI 身份执行一次：
+
+```bash
+cd /data/wlf1/viking-forge-workspace/automation/viking-forge
+uv run python scripts/labels.py --repo wlff123/OpenViking
+```
+
+保留的标签包括 `agent:analyze`、`agent:retriage`、`agent:ready`、`agent:claimed`、`agent:triaged`、`agent:blocked`、`agent:pr-open`、`agent:generated`、`agent:ignored`、`agent:human-only` 和 `needs:info`。
+
+## 7. 日常使用
+
+1. 社区成员创建新 Issue。
+2. 维护者打开面板，选择“忽略”或“继续分析”。
+3. 分诊完成后，到 GitHub 阅读机器人评论。
+4. 只有结论明确、风险可接受时，由有写权限的维护者添加 `agent:ready`。
+5. 打开生成的草稿 PR，检查 diff、测试、CI 和安全影响。
+6. 人工决定修改、关闭、转为 Ready 或合并。
+
+Issue 编辑本身不会重复分诊。需要重新分析时，由维护者添加 `agent:retriage`。非维护者添加 `agent:ready` 或 `agent:retriage` 不会启动任务。
+
+## 8. 运维与恢复
+
+查看状态：
+
+```bash
+sqlite3 /data/wlf1/viking-forge-runtime/viking-forge.sqlite3 \
+  'select issue_number,bot_state,active_run_id,last_error from issues order by updated_at desc;'
+```
+
+备份时复制 SQLite 主文件及同目录的 `-wal`、`-shm` 文件，或先停止服务再复制主文件。运行日志和结果位于 `RUNS_DIRECTORY/<run_id>/`。
+
+紧急停止：
+
+```bash
+sudo systemctl stop viking-forge
+```
+
+容器内手工启动时，向 Uvicorn 进程发送 `SIGTERM`。停止服务不会删除队列；重启时遗留的 `running` 任务会恢复为 `queued`。若要阻止新任务，同时停掉服务并在 GitHub 暂停 Webhook，不要直接修改 SQLite。
+
+## 9. 验收清单
+
+- `codex login status` 显示 ChatGPT 已登录。
+- `/healthz` 返回 `{"status":"ok"}`。
+- GitHub Webhook 最近一次投递为 2xx。
+- 新 Issue 出现在面板但没有自动运行。
+- 点击“继续分析”后生成分诊评论。
+- 维护者添加 `agent:ready` 后生成不同 run ID 的修复任务。
+- 修复只创建草稿 PR，不自动合并。
+- GitHub Actions Secrets 和 Variables 中没有 VikingForge 配置。

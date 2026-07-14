@@ -89,6 +89,14 @@ def test_health_is_public(app_parts):
     assert response.json() == {"status": "ok"}
 
 
+def test_callback_routes_are_removed(app_parts):
+    client, _, _ = app_parts
+
+    paths = {route.path for route in client.app.routes}
+
+    assert not any(path.startswith("/callbacks/") for path in paths)
+
+
 def test_dashboard_requires_auth_and_escapes_issue_title(app_parts):
     client, store, _ = app_parts
     add_issue(store)

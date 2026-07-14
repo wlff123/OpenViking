@@ -1,0 +1,22 @@
+[Unit]
+Description=VikingForge local Codex issue worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wlf1
+Group=wlf1
+WorkingDirectory=/data/wlf1/viking-forge-workspace/automation/viking-forge
+EnvironmentFile=/data/wlf1/viking-forge-runtime/viking-forge.env
+Environment=CODEX_HOME=/home/wlf1/.codex
+Environment=PATH=/home/wlf1/.local/bin:/usr/local/nvm/versions/node/v25.9.0/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/wlf1/.local/bin/uv run uvicorn viking_forge.main:app --host 0.0.0.0 --port 18081
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -44,30 +44,33 @@ def test_runtime_uses_one_local_worker_and_no_callback_secret():
 
 def test_deployment_assets_stay_in_viking_forge_directory():
     for relative in (
-        ".dockerignore",
-        "deploy/Dockerfile",
-        "deploy/docker-compose.yml",
-        "deploy/Caddyfile",
         "deploy/.env.example",
+        "deploy/viking-forge.service",
         "docs/deployment.md",
         "README.md",
     ):
         assert (PROJECT / relative).is_file(), relative
 
 
-def test_docker_context_uses_a_source_allowlist():
-    dockerignore = (PROJECT / ".dockerignore").read_text()
+def test_obsolete_container_deployment_assets_are_removed():
+    for relative in (
+        ".dockerignore",
+        "deploy/Dockerfile",
+        "deploy/docker-compose.yml",
+        "deploy/Caddyfile",
+    ):
+        assert not (PROJECT / relative).exists(), relative
 
-    assert dockerignore.startswith("*\n")
-    assert "!src/**" in dockerignore
-    assert "!.env" not in dockerignore
 
+def test_local_service_runs_as_wlf1_with_local_codex_state():
+    service = (PROJECT / "deploy" / "viking-forge.service").read_text()
+    environment = (PROJECT / "deploy" / ".env.example").read_text()
 
-def test_docker_image_prepares_writable_data_directory():
-    dockerfile = (PROJECT / "deploy/Dockerfile").read_text()
-
-    prepare_data = dockerfile.index("mkdir -p /data")
-    run_as_app = dockerfile.index("USER app")
-
-    assert prepare_data < run_as_app
-    assert "chown app:app /data" in dockerfile
+    assert "User=wlf1" in service
+    assert "viking_forge.main:app" in service
+    assert "CODEX_HOME=/home/wlf1/.codex" in service
+    assert "REPOSITORY_PATH=" in environment
+    assert "RUNS_DIRECTORY=" in environment
+    assert "GITHUB_APP_PRIVATE_KEY_FILE=" in environment
+    assert "OPENAI_API_KEY" not in environment
+    assert "CALLBACK_SECRET" not in environment
