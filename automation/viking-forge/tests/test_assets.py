@@ -37,6 +37,13 @@ def test_triage_workflow_requires_human_analysis_label():
     assert "automation/viking-forge/prompts/triage.md" in workflow
 
 
+def test_triage_workflow_allows_only_the_viking_forge_bot():
+    workflow = (REPOSITORY / ".github/workflows/agent-triage.yml").read_text()
+
+    assert "allow-bot-users: ${{ vars.VIKING_FORGE_APP_SLUG }}[bot]" in workflow
+    assert "allow-bot-users: true" not in workflow
+
+
 def test_fix_workflow_creates_only_draft_prs_after_guard():
     workflow = (REPOSITORY / ".github/workflows/agent-fix.yml").read_text()
 
