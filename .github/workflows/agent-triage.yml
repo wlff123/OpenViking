@@ -60,7 +60,7 @@ jobs:
           output-file: triage.json
           working-directory: ${{ github.workspace }}
           permission-profile: ':read-only'
-          allow-bot-users: true
+          allow-bot-users: ${{ vars.VIKING_FORGE_APP_SLUG }}[bot]
           model: ${{ vars.VIKING_FORGE_CODEX_MODEL }}
           effort: ${{ vars.VIKING_FORGE_CODEX_EFFORT }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
