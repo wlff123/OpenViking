@@ -26,6 +26,7 @@
             <th>标题</th>
             <th>作者</th>
             <th>状态</th>
+            <th>任务</th>
             <th>分诊摘要</th>
             <th>链接</th>
             <th>操作</th>
@@ -38,10 +39,13 @@
             <td>{{ issue.title }}</td>
             <td>{{ issue.author }}</td>
             <td><span class="status status-{{ issue.bot_state }}">{{ issue.bot_state }}</span></td>
-            <td>{{ issue.triage_json or "-" }}</td>
+            <td>{{ issue.run_status or "-" }}</td>
+            <td>
+              {{ issue.triage_summary }}
+              {% if issue.last_error %}<div class="error">{{ issue.last_error }}</div>{% endif %}
+            </td>
             <td class="links">
               <a href="{{ issue.issue_url }}">Issue</a>
-              {% if issue.workflow_url %}<a href="{{ issue.workflow_url }}">Workflow</a>{% endif %}
               {% if issue.pr_url %}<a href="{{ issue.pr_url }}">PR</a>{% endif %}
             </td>
             <td>
@@ -62,7 +66,7 @@
             </td>
           </tr>
           {% else %}
-          <tr><td colspan="7" class="empty">没有匹配的 Issue</td></tr>
+          <tr><td colspan="8" class="empty">没有匹配的 Issue</td></tr>
           {% endfor %}
         </tbody>
       </table>

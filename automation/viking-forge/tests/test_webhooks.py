@@ -229,3 +229,40 @@ def test_unrelated_repository_is_rejected(tmp_path):
 
     assert apply_github_event(store, "issues", "delivery", payload) == "rejected"
     assert store.get_issue(8) is None
+
+
+@pytest.mark.parametrize(
+    ("merged", "expected_state"),
+    [(True, "merged"), (False, "closed")],
+)
+def test_generated_pull_request_closed_updates_issue(tmp_path, merged, expected_state):
+    store = make_store(tmp_path)
+    store.upsert_issue(8, "rev", "Title", "https://example.test/8", "user", "open")
+    for state in (
+        "triaging",
+        "waiting_approval",
+        "claimed",
+        "coding",
+        "validating",
+        "publishing",
+        "pr_open",
+    ):
+        store.transition_issue(8, state, event_type=f"entered_{state}")
+    store.update_issue_metadata(8, pr_number=19, pr_url="https://example.test/pull/19")
+    payload = {
+        "action": "closed",
+        "repository": {"full_name": "volcengine/OpenViking"},
+        "pull_request": {
+            "number": 19,
+            "merged": merged,
+            "html_url": "https://example.test/pull/19",
+            "labels": [{"name": "agent:generated"}],
+        },
+    }
+
+    result = apply_github_event(store, "pull_request", "pr-19", payload)
+
+    assert result == "applied"
+    assert store.get_issue(8)["bot_state"] == expected_state
+    notification = store.get_notification("pr:19:merged", "merged")
+    assert (notification is not None) is merged

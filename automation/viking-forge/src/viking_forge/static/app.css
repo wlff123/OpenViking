@@ -28,6 +28,7 @@ td { font-size: 13px; }
 .status-awaiting_decision { color: #8a5a00; }
 .status-blocked { color: #a32929; }
 .status-pr_open, .status-merged { color: #147d71; }
+.error { max-width: 420px; margin-top: 5px; color: #a32929; white-space: pre-wrap; }
 .links, .actions { display: flex; gap: 8px; align-items: center; }
 button {
   min-height: 32px;

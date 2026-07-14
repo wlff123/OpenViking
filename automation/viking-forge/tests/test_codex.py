@@ -103,9 +103,7 @@ def test_fix_uses_workspace_write_and_temporary_triage_context(tmp_path):
     ("result", "exit_code", "message"),
     [("{}", 7, "exited with status 7"), ("not-json", 0, "invalid JSON")],
 )
-def test_codex_failure_is_reported_and_context_is_removed(
-    tmp_path, result, exit_code, message
-):
+def test_codex_failure_is_reported_and_context_is_removed(tmp_path, result, exit_code, message):
     executable = make_fake_codex(tmp_path, result, exit_code)
     runner = make_runner(executable, {"PATH": os.environ["PATH"]})
     worktree = tmp_path / "worktree"

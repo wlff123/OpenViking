@@ -45,16 +45,20 @@ def app_parts(tmp_path):
         dashboard_password="password",
         dashboard_csrf_secret="csrf-value",
         github_webhook_secret="webhook",
-        callback_secret="callback",
         github_app_id="123",
         github_app_slug="vikingforge-wlff123",
         github_app_private_key="private-key",
         feishu_webhook_url="",
+        repository_path=str(tmp_path / "repository"),
+        runs_directory=str(tmp_path / "runs"),
+        git_remote="fork",
+        base_branch="main",
+        codex_executable="codex",
     )
     store = Store(config.database_path)
     store.initialize()
     github = FakeGitHub()
-    app = create_app(config=config, store=store, github=github, start_background_tasks=False)
+    app = create_app(config=config, store=store, github=github)
     yield TestClient(app), store, github
     store.close()
 
@@ -271,34 +275,6 @@ def test_webhook_rejects_invalid_signature(app_parts):
     assert response.status_code == 403
 
 
-def test_signed_workflow_callback_updates_state(app_parts):
-    client, store, _ = app_parts
-    add_issue(store, 22)
-    store.transition_issue(22, "triaging", event_type="analysis_requested")
-    revision = store.get_issue(22)["revision"]
-    payload = {
-        "event_id": "triage:22:done",
-        "issue_number": 22,
-        "issue_revision": revision,
-        "stage": "waiting_approval",
-        "summary": "Small parser fix",
-    }
-    body = json.dumps(payload, separators=(",", ":")).encode()
-    signature = hmac.new(b"callback", body, hashlib.sha256).hexdigest()
-
-    response = client.post(
-        "/callbacks/workflow",
-        content=body,
-        headers={
-            "Content-Type": "application/json",
-            "X-Viking-Forge-Signature": signature,
-        },
-    )
-
-    assert response.status_code == 200
-    assert store.get_issue(22)["bot_state"] == "waiting_approval"
-
-
 def test_dashboard_uses_readable_chinese_actions(app_parts):
     client, store, _ = app_parts
     add_issue(store)
@@ -307,53 +283,3 @@ def test_dashboard_uses_readable_chinese_actions(app_parts):
 
     assert "忽略" in response.text
     assert "继续分析" in response.text
-
-
-def test_signed_reconcile_callback_applies_github_snapshot(app_parts):
-    client, store, _ = app_parts
-    payload = {
-        "snapshot_id": "reconcile:123",
-        "issues": [
-            {
-                "issue_number": 31,
-                "revision": "revision-31",
-                "title": "Reconciled issue",
-                "issue_url": "https://github.com/volcengine/OpenViking/issues/31",
-                "author": "reporter",
-                "github_state": "open",
-                "bot_state": "waiting_approval",
-                "pr_number": None,
-                "pr_url": None,
-            }
-        ],
-    }
-    body = json.dumps(payload, separators=(",", ":")).encode()
-    signature = hmac.new(b"callback", body, hashlib.sha256).hexdigest()
-
-    response = client.post(
-        "/callbacks/reconcile",
-        content=body,
-        headers={
-            "Content-Type": "application/json",
-            "X-Viking-Forge-Signature": signature,
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"status": "applied"}
-    assert store.get_issue(31)["bot_state"] == "waiting_approval"
-
-
-def test_reconcile_callback_is_idempotent(app_parts):
-    client, _, _ = app_parts
-    payload = {"snapshot_id": "reconcile:same", "issues": []}
-    body = json.dumps(payload, separators=(",", ":")).encode()
-    signature = hmac.new(b"callback", body, hashlib.sha256).hexdigest()
-    headers = {"X-Viking-Forge-Signature": signature}
-
-    assert client.post("/callbacks/reconcile", content=body, headers=headers).json() == {
-        "status": "applied"
-    }
-    assert client.post("/callbacks/reconcile", content=body, headers=headers).json() == {
-        "status": "ignored"
-    }

@@ -1,5 +1,4 @@
 import json
-import re
 from pathlib import Path
 
 
@@ -25,52 +24,22 @@ def test_codex_schemas_are_valid_and_closed():
         assert schema["additionalProperties"] is False
 
 
-def test_triage_workflow_requires_human_analysis_label():
-    workflow = (REPOSITORY / ".github/workflows/agent-triage.yml").read_text()
-
-    assert "issues:" in workflow
-    assert "types: [labeled]" in workflow
-    assert "opened" not in workflow
-    assert "reopened" not in workflow
-    assert "agent:analyze" in workflow
-    assert "agent:retriage" in workflow
-    assert "automation/viking-forge/prompts/triage.md" in workflow
+def test_github_actions_execution_assets_are_removed():
+    for name in ("agent-triage.yml", "agent-fix.yml", "agent-reconcile.yml"):
+        assert not (REPOSITORY / ".github" / "workflows" / name).exists()
+    for name in ("issue_context.py", "post_callback.py", "reconcile.py"):
+        assert not (PROJECT / "scripts" / name).exists()
+    assert not (PROJECT / "src" / "viking_forge" / "callbacks.py").exists()
 
 
-def test_triage_workflow_allows_only_the_viking_forge_bot():
-    workflow = (REPOSITORY / ".github/workflows/agent-triage.yml").read_text()
+def test_runtime_uses_one_local_worker_and_no_callback_secret():
+    main = (PROJECT / "src" / "viking_forge" / "main.py").read_text()
+    config = (PROJECT / "src" / "viking_forge" / "config.py").read_text()
 
-    assert "allow-bot-users: ${{ vars.VIKING_FORGE_APP_SLUG }}[bot]" in workflow
-    assert "allow-bot-users: true" not in workflow
-
-
-def test_fix_workflow_creates_only_draft_prs_after_guard():
-    workflow = (REPOSITORY / ".github/workflows/agent-fix.yml").read_text()
-
-    assert "agent:ready" in workflow
-    assert "guard_patch.py" in workflow
-    assert "--draft" in workflow
-    assert "agent:generated" in workflow
-    assert "persist-credentials: false" in workflow
-
-
-def test_reconciliation_runs_hourly_without_codex():
-    workflow = (REPOSITORY / ".github/workflows/agent-reconcile.yml").read_text()
-
-    assert "workflow_dispatch:" in workflow
-    assert "cron: '17 * * * *'" in workflow
-    assert "reconcile.py" in workflow
-    assert "codex-action" not in workflow
-
-
-def test_external_actions_are_pinned_to_full_sha():
-    workflows = "\n".join(
-        path.read_text() for path in (REPOSITORY / ".github/workflows").glob("agent-*.yml")
-    )
-    action_refs = re.findall(r"uses:\s+[^\s@]+@([^\s#]+)", workflows)
-
-    assert action_refs
-    assert all(re.fullmatch(r"[0-9a-f]{40}", value) for value in action_refs)
+    assert "LocalWorker" in main
+    assert 'name="viking-forge-worker"' in main
+    assert "CALLBACK_SECRET" not in config
+    assert "callback_secret" not in config
 
 
 def test_deployment_assets_stay_in_viking_forge_directory():

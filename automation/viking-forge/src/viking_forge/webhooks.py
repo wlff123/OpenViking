@@ -21,6 +21,8 @@ def apply_github_event(
         return "rejected"
     if not store.record_delivery(f"github:{delivery_id}", event_type):
         return "ignored"
+    if event_type == "pull_request":
+        return _apply_pull_request_event(store, payload)
     if event_type != "issues":
         return "ignored"
     issue = payload.get("issue") or {}
@@ -114,3 +116,37 @@ def _eligible_for_fix(store: Store, issue_number: int, webhook_issue: dict[str, 
         "agent:claimed",
     }
     return not labels.intersection(exclusions)
+
+
+def _apply_pull_request_event(store: Store, payload: dict[str, Any]) -> str:
+    pull_request = payload.get("pull_request") or {}
+    labels = {str(label.get("name", "")) for label in pull_request.get("labels", [])}
+    if payload.get("action") != "closed" or "agent:generated" not in labels:
+        return "ignored"
+    pr_number = int(pull_request["number"])
+    issue = store.get_issue_by_pr_number(pr_number)
+    if issue is None or issue["bot_state"] != "pr_open":
+        return "ignored"
+    merged = bool(pull_request.get("merged"))
+    target = "merged" if merged else "closed"
+    store.transition_issue(
+        int(issue["issue_number"]),
+        target,
+        event_type="generated_pr_merged" if merged else "generated_pr_closed",
+        payload={"pr_number": pr_number},
+    )
+    if merged:
+        store.enqueue_notification(
+            f"pr:{pr_number}:merged",
+            "merged",
+            {
+                "issue_number": issue["issue_number"],
+                "issue_title": issue["title"],
+                "issue_url": issue["issue_url"],
+                "status": "merged",
+                "summary": "VikingForge 草稿 PR 已合并",
+                "validation": "-",
+                "pr_url": pull_request.get("html_url") or issue["pr_url"],
+            },
+        )
+    return "applied"

@@ -60,27 +60,6 @@ def test_delivery_ids_are_idempotent(store):
     assert store.record_delivery("github:abc", "issues") is False
 
 
-def test_snapshot_reconciles_state_without_transition_history(store):
-    snapshot = {
-        "issue_number": 9,
-        "revision": "live-revision",
-        "title": "Live title",
-        "issue_url": "https://example.test/9",
-        "author": "reporter",
-        "github_state": "open",
-        "bot_state": "pr_open",
-        "pr_number": 17,
-        "pr_url": "https://example.test/pull/17",
-    }
-
-    store.apply_snapshot([snapshot])
-
-    issue = store.get_issue(9)
-    assert issue["bot_state"] == "pr_open"
-    assert issue["pr_number"] == 17
-    assert issue["pr_url"] == "https://example.test/pull/17"
-
-
 def test_closed_issue_can_be_confirmed_as_merged(store):
     store.upsert_issue(10, "rev", "Title", "https://example.test/10", "user", "open")
     store.transition_issue(10, "closed", event_type="issue_closed")

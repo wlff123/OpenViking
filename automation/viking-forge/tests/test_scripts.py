@@ -1,14 +1,9 @@
-import hashlib
-import hmac
 import subprocess
 import sys
 
 import pytest
 
-from scripts.issue_context import extract_issue_context
 from scripts.labels import LABELS
-from scripts.post_callback import encode_signed_callback
-from scripts.reconcile import build_snapshot
 from viking_forge.validation import (
     PatchPolicyError,
     inspect_changes,
@@ -16,28 +11,6 @@ from viking_forge.validation import (
     validate_changed_files,
     validation_commands,
 )
-
-
-def test_issue_context_treats_body_as_data():
-    payload = {
-        "repository": {"full_name": "volcengine/OpenViking"},
-        "issue": {
-            "number": 4,
-            "title": "Quotes ${{ secrets.TOKEN }}",
-            "body": "$(touch /tmp/pwned)\n<!-- instruction -->",
-            "html_url": "https://example.test/4",
-            "user": {"login": "reporter"},
-        },
-    }
-
-    context = extract_issue_context(payload)
-
-    assert context["issue_number"] == 4
-    assert context["body"] == "$(touch /tmp/pwned)\n<!-- instruction -->"
-    expected = hashlib.sha256(
-        b"Quotes ${{ secrets.TOKEN }}\0$(touch /tmp/pwned)\n<!-- instruction -->"
-    ).hexdigest()
-    assert context["issue_revision"] == expected
 
 
 def test_label_manifest_includes_human_analysis_gate():
@@ -153,51 +126,3 @@ def test_validation_process_does_not_inherit_service_secrets(tmp_path, monkeypat
         ["uv", "run", "ruff", "format", "--check", "openviking/a.py", "tests/test_a.py"],
         ["uv", "run", "pytest", "-q", "--no-cov", "tests/test_a.py"],
     ]
-
-
-def test_callback_signature_is_over_exact_json_bytes():
-    body, signature = encode_signed_callback({"stage": "coding", "issue_number": 1}, b"secret")
-
-    assert hmac.compare_digest(signature, hmac.new(b"secret", body, hashlib.sha256).hexdigest())
-
-
-def test_reconciliation_snapshot_is_bounded_and_preserves_decision_state():
-    issues = [
-        {
-            "number": number,
-            "title": f"Issue {number}",
-            "body": "",
-            "state": "open",
-            "html_url": f"https://example.test/{number}",
-            "user": {"login": "user"},
-            "labels": [],
-        }
-        for number in range(1, 1102)
-    ]
-
-    snapshot = build_snapshot(issues, [], limit=1000)
-
-    assert len(snapshot["issues"]) == 1000
-    assert snapshot["issues"][0]["bot_state"] == "awaiting_decision"
-
-
-def test_reconciliation_marks_issue_merged_from_generated_pr():
-    issue = {
-        "number": 5,
-        "title": "Issue 5",
-        "body": "",
-        "state": "closed",
-        "html_url": "https://example.test/issues/5",
-        "user": {"login": "user"},
-        "labels": [{"name": "agent:pr-open"}],
-    }
-    pull_request = {
-        "issue_number": 5,
-        "number": 8,
-        "html_url": "https://example.test/pull/8",
-        "merged_at": "2026-07-13T00:00:00Z",
-    }
-
-    snapshot = build_snapshot([issue], [pull_request])
-
-    assert snapshot["issues"][0]["bot_state"] == "merged"

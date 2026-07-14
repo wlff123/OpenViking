@@ -27,7 +27,6 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "merged": set(),
     "closed": {"awaiting_decision", "merged"},
 }
-SNAPSHOT_STATES = frozenset(ALLOWED_TRANSITIONS)
 
 
 class Store:
@@ -65,7 +64,6 @@ class Store:
                 bot_state TEXT NOT NULL,
                 triage_json TEXT,
                 active_run_id TEXT,
-                workflow_url TEXT,
                 pr_number INTEGER,
                 pr_url TEXT,
                 last_error TEXT,
@@ -178,52 +176,23 @@ class Store:
     def list_issues(self, state: str | None = None) -> list[dict[str, Any]]:
         if state:
             rows = self.connection.execute(
-                "SELECT * FROM issues WHERE bot_state = ? ORDER BY updated_at DESC, issue_number DESC",
+                """
+                SELECT issues.*, runs.status AS run_status
+                FROM issues LEFT JOIN runs ON runs.run_id = issues.active_run_id
+                WHERE issues.bot_state = ?
+                ORDER BY issues.updated_at DESC, issues.issue_number DESC
+                """,
                 (state,),
             ).fetchall()
         else:
             rows = self.connection.execute(
-                "SELECT * FROM issues ORDER BY updated_at DESC, issue_number DESC"
+                """
+                SELECT issues.*, runs.status AS run_status
+                FROM issues LEFT JOIN runs ON runs.run_id = issues.active_run_id
+                ORDER BY issues.updated_at DESC, issues.issue_number DESC
+                """
             ).fetchall()
         return [dict(row) for row in rows]
-
-    def apply_snapshot(self, issues: list[dict[str, Any]]) -> None:
-        now = int(time.time())
-        with self._lock, self.connection:
-            for issue in issues:
-                bot_state = str(issue["bot_state"])
-                if bot_state not in SNAPSHOT_STATES:
-                    raise ValueError(f"Unknown bot state: {bot_state}")
-                self.connection.execute(
-                    """
-                    INSERT INTO issues(
-                        issue_number, revision, title, issue_url, author,
-                        github_state, bot_state, pr_number, pr_url, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(issue_number) DO UPDATE SET
-                        revision=excluded.revision,
-                        title=excluded.title,
-                        issue_url=excluded.issue_url,
-                        author=excluded.author,
-                        github_state=excluded.github_state,
-                        bot_state=excluded.bot_state,
-                        pr_number=excluded.pr_number,
-                        pr_url=excluded.pr_url,
-                        updated_at=excluded.updated_at
-                    """,
-                    (
-                        int(issue["issue_number"]),
-                        str(issue["revision"]),
-                        str(issue["title"]),
-                        str(issue["issue_url"]),
-                        str(issue["author"]),
-                        str(issue["github_state"]),
-                        bot_state,
-                        issue.get("pr_number"),
-                        issue.get("pr_url"),
-                        now,
-                    ),
-                )
 
     def transition_issue(
         self,
@@ -398,7 +367,6 @@ class Store:
         issue_number: int,
         *,
         triage: dict[str, Any] | None = None,
-        workflow_url: str | None = None,
         pr_number: int | None = None,
         pr_url: str | None = None,
     ) -> None:
@@ -407,9 +375,6 @@ class Store:
         if triage is not None:
             fields.append("triage_json = ?")
             values.append(json.dumps(triage, ensure_ascii=False))
-        if workflow_url is not None:
-            fields.append("workflow_url = ?")
-            values.append(workflow_url)
         if pr_number is not None:
             fields.append("pr_number = ?")
             values.append(pr_number)
@@ -426,6 +391,12 @@ class Store:
                 f"UPDATE issues SET {', '.join(fields)} WHERE issue_number = ?",
                 values,
             )
+
+    def get_issue_by_pr_number(self, pr_number: int) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM issues WHERE pr_number = ?", (pr_number,)
+        ).fetchone()
+        return dict(row) if row else None
 
     def update_issue_error(self, issue_number: int, error: str | None) -> None:
         value = error[-2000:] if error else None
