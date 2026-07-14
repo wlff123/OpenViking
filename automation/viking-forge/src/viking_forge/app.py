@@ -23,6 +23,8 @@ class GitHubDecisions(Protocol):
 
     def add_label(self, issue_number: int, label: str) -> None: ...
 
+    def get_collaborator_permission(self, login: str) -> str: ...
+
 
 def create_app(
     *,
@@ -77,15 +79,32 @@ def create_app(
             payload = json.loads(body)
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+        actor_can_write = False
+        label = payload.get("label", {}).get("name")
+        if (
+            event_type == "issues"
+            and payload.get("action") == "labeled"
+            and label in {"agent:ready", "agent:retriage"}
+        ):
+            login = str(payload.get("sender", {}).get("login", ""))
+            try:
+                permission = github.get_collaborator_permission(login)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=502, detail="GitHub permission check failed"
+                ) from exc
+            actor_can_write = permission in {"admin", "maintain", "write"}
         result = apply_github_event(
             store,
             event_type,
             delivery_id,
             payload,
+            trusted_app_login=f"{config.github_app_slug}[bot]",
+            actor_can_write=actor_can_write,
             repository=config.repository,
         )
         if result == "rejected":
-            raise HTTPException(status_code=403, detail="Unexpected repository")
+            raise HTTPException(status_code=403, detail="Rejected GitHub event")
         return {"status": result}
 
     @app.post("/callbacks/workflow")

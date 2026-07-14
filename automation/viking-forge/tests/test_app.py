@@ -16,6 +16,8 @@ class FakeGitHub:
         self.labels = []
         self.issue = {"state": "open", "title": "<script>alert(1)</script>", "body": "Body"}
         self.error = None
+        self.permission = "write"
+        self.permission_calls = []
 
     def get_issue(self, issue_number):
         if self.error:
@@ -26,6 +28,12 @@ class FakeGitHub:
         if self.error:
             raise self.error
         self.labels.append((issue_number, label))
+
+    def get_collaborator_permission(self, login):
+        if self.error:
+            raise self.error
+        self.permission_calls.append(login)
+        return self.permission
 
 
 @pytest.fixture
@@ -39,6 +47,7 @@ def app_parts(tmp_path):
         github_webhook_secret="webhook",
         callback_secret="callback",
         github_app_id="123",
+        github_app_slug="vikingforge-wlff123",
         github_app_private_key="private-key",
         feishu_webhook_url="",
     )
@@ -199,6 +208,50 @@ def test_signed_github_webhook_adds_pending_issue(app_parts):
     assert response.status_code == 200
     assert response.json() == {"status": "applied"}
     assert store.get_issue(21)["bot_state"] == "awaiting_decision"
+
+
+def test_ready_webhook_checks_permission_and_queues_local_fix(app_parts):
+    client, store, github = app_parts
+    add_issue(store, 23)
+    store.transition_issue(23, "triaging", event_type="analysis_requested")
+    store.update_issue_metadata(
+        23,
+        triage={"candidate": True, "needs_info": False, "risk_flags": []},
+    )
+    store.transition_issue(23, "waiting_approval", event_type="triage_complete")
+    payload = {
+        "action": "labeled",
+        "repository": {"full_name": "volcengine/OpenViking"},
+        "issue": {
+            "number": 23,
+            "title": "<script>alert(1)</script>",
+            "body": "Body",
+            "html_url": "https://github.com/volcengine/OpenViking/issues/23",
+            "state": "open",
+            "user": {"login": "reporter"},
+            "labels": [{"name": "agent:ready"}],
+        },
+        "label": {"name": "agent:ready"},
+        "sender": {"login": "maintainer"},
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    signature = "sha256=" + hmac.new(b"webhook", body, hashlib.sha256).hexdigest()
+
+    response = client.post(
+        "/webhooks/github",
+        content=body,
+        headers={
+            "X-GitHub-Event": "issues",
+            "X-GitHub-Delivery": "delivery-ready-23",
+            "X-Hub-Signature-256": signature,
+        },
+    )
+
+    assert response.status_code == 200
+    assert github.permission_calls == ["maintainer"]
+    issue = store.get_issue(23)
+    assert issue["bot_state"] == "claimed"
+    assert store.get_run(issue["active_run_id"])["kind"] == "fix"
 
 
 def test_webhook_rejects_invalid_signature(app_parts):
